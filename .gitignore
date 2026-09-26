@@ -1,0 +1,6 @@
+/target/
+.env
+*.log
+/node_modules/
+/test-results/
+/playwright-report/
