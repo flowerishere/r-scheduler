@@ -12,6 +12,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Apply embedded database migrations.
+    Migrate,
     /// Internal isolated rule evaluator. JSON on stdin/stdout.
     #[command(hide = true)]
     Evaluate,
