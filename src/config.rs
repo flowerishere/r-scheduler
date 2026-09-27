@@ -1,7 +1,21 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use anyhow::{Context, bail};
-use clap::ValueEnum;
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Parser)]
+#[command(version, about)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Internal isolated rule evaluator. JSON on stdin/stdout.
+    #[command(hide = true)]
+    Evaluate,
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Role {
