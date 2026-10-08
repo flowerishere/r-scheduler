@@ -1102,3 +1102,142 @@ mod engine_tests {
         );
     }
 }
+
+mod claim_tests {
+    use super::schedule_spec as spec;
+    use scheduler_service::{
+        domain::{ConcurrencyPolicy, Run, Schedule},
+        store::Store,
+    };
+    use sqlx::PgPool;
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn concurrent_workers_claim_once(pool: PgPool) {
+        let store = Store { pool };
+        create_run(&store).await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let store = store.clone();
+            tasks.spawn(async move { store.claim().await.unwrap() });
+        }
+        let mut claims = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Some(run) = result.unwrap() {
+                claims.push(run);
+            }
+        }
+        assert_eq!(claims.len(), 1);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attempts WHERE run_id=$1 AND status='running'",
+        )
+        .bind(claims[0].id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(claims[0].attempt_count, 1);
+        assert_eq!(claims[0].cycle_attempts, 1);
+        assert!(claims[0].lease_token.is_some());
+        assert!(claims[0].lease_until.unwrap() > store.now().await.unwrap());
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn forbid_concurrency_is_enforced_across_workers(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(10);
+        let mut spec = spec(at);
+        spec.concurrency = ConcurrencyPolicy::Forbid;
+        let schedule = store
+            .create("tenant-a", spec, at, None, "test")
+            .await
+            .unwrap();
+        store
+            .materialize(&schedule, &[at, at + chrono::Duration::seconds(1)], None)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(store.claim(), store.claim());
+        let claims: Vec<_> = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(claims.len(), 1);
+        assert!(store.claim().await.unwrap().is_none());
+        let other = create_run(&store).await;
+        assert_eq!(store.claim().await.unwrap().unwrap().schedule_id, other.id);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn claim_skips_paused_cancelled_stale_and_unavailable_work(pool: PgPool) {
+        let store = Store { pool };
+        for status in ["paused", "cancelled", "error"] {
+            let schedule = create_run(&store).await;
+            sqlx::query("UPDATE schedules SET status=$2 WHERE id=$1")
+                .bind(schedule.id)
+                .bind(status)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let stale = create_run(&store).await;
+        sqlx::query("UPDATE schedules SET revision=revision+1 WHERE id=$1")
+            .bind(stale.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let later = create_run(&store).await;
+        sqlx::query(
+            "UPDATE runs SET available_at=clock_timestamp()+INTERVAL '1 hour' WHERE schedule_id=$1",
+        )
+        .bind(later.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.claim().await.unwrap().is_none());
+        let eligible = create_run(&store).await;
+        let run = store.claim().await.unwrap().unwrap();
+        assert_eq!(run.schedule_id, eligible.id);
+        assert!(store.claim().await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn failed_attempt_insert_rolls_back_the_claim_and_lease(pool: PgPool) {
+        let store = Store { pool };
+        let schedule = create_run(&store).await;
+        sqlx::query("CREATE FUNCTION reject_test_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test attempt failure'; END $$").execute(&store.pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_test_attempt BEFORE INSERT ON attempts FOR EACH ROW EXECUTE FUNCTION reject_test_attempt()").execute(&store.pool).await.unwrap();
+        assert!(store.claim().await.is_err());
+        let run: Run = sqlx::query_as("SELECT * FROM runs WHERE schedule_id=$1")
+            .bind(schedule.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(run.status, "pending");
+        assert_eq!(run.attempt_count, 0);
+        assert_eq!(run.cycle_attempts, 0);
+        assert!(run.lease_token.is_none());
+        assert!(run.lease_until.is_none());
+        sqlx::query("DROP TRIGGER reject_test_attempt ON attempts")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.claim().await.unwrap().is_some());
+    }
+}
