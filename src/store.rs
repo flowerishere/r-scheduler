@@ -1,8 +1,8 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
-use crate::domain::{Schedule, ScheduleSpec};
+use crate::domain::{DeliveryResult, Run, Schedule, ScheduleSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -200,5 +200,65 @@ impl Store {
             .bind(snapshot.id).bind(snapshot.revision).bind(snapshot.next_fire_at).bind(error)
             .execute(&self.pool).await?;
         Ok(())
+    }
+    pub async fn finish(&self, run: &Run, outcome: DeliveryResult) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let changed = Self::record_outcome(&mut tx, run, outcome).await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+    async fn record_outcome(
+        tx: &mut Transaction<'_, Postgres>,
+        snapshot: &Run,
+        outcome: DeliveryResult,
+    ) -> Result<bool> {
+        let schedule = Self::lock_schedule(tx, &snapshot.tenant_id, snapshot.schedule_id).await?;
+        let current: Option<Run> = sqlx::query_as("SELECT * FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(snapshot.id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut **tx)
+            .await?;
+        if current.status != "running"
+            || current.lease_token != snapshot.lease_token
+            || current.lease_until.is_none_or(|end| end <= now)
+        {
+            return Ok(false);
+        }
+        let obsolete = schedule.status == "cancelled" || schedule.revision != current.revision;
+        let delay = current.spec.retry.delay(current.cycle_attempts, current.id);
+        let retry_at = now + Duration::seconds(delay);
+        let status = if outcome.success {
+            "succeeded"
+        } else if obsolete {
+            "cancelled"
+        } else if current.cycle_attempts >= current.spec.retry.max_attempts as i32 {
+            "dead"
+        } else {
+            "pending"
+        };
+        let attempt_status = if outcome.success {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        sqlx::query("UPDATE attempts SET status = $2, finished_at = $3, http_status = $4, error = $5, response_excerpt = $6 WHERE lease_token = $1 AND status = 'running'")
+            .bind(current.lease_token).bind(attempt_status).bind(now).bind(outcome.http_status)
+            .bind(&outcome.error).bind(&outcome.response_excerpt).execute(&mut **tx).await?;
+        let available = if status == "pending" {
+            retry_at
+        } else {
+            current.available_at
+        };
+        let finished = if status == "pending" { None } else { Some(now) };
+        let last_error = outcome.error;
+        sqlx::query("UPDATE runs SET status = $2, available_at = $3, lease_token = NULL, lease_until = NULL, last_error = $4, finished_at = $5 WHERE id = $1")
+            .bind(current.id).bind(status).bind(available).bind(last_error).bind(finished)
+            .execute(&mut **tx).await?;
+        Ok(true)
     }
 }

@@ -204,3 +204,13 @@ impl DeliveryResult {
         }
     }
 }
+
+impl RetryPolicy {
+    pub fn delay(&self, attempt: i32, run_id: Uuid) -> i64 {
+        let exponent = (attempt.saturating_sub(1) as u32).min(30);
+        let base = u64::from(self.initial_delay_seconds).saturating_mul(1_u64 << exponent);
+        let jitter = (run_id.as_u128() as u64).wrapping_add(attempt as u64 * 31) % (base / 4 + 1);
+        base.saturating_add(jitter)
+            .min(u64::from(self.max_delay_seconds)) as i64
+    }
+}

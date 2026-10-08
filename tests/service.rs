@@ -1346,3 +1346,229 @@ mod webhook_tests {
         let _ = server.await;
     }
 }
+
+mod retry_tests {
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+    use scheduler_service::{
+        domain::{Attempt, DeliveryResult, RetryPolicy, Run},
+        store::Store,
+        webhook,
+    };
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    async fn get_run(store: &Store, id: Uuid) -> Run {
+        sqlx::query_as("SELECT * FROM runs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+    async fn make_ready(store: &Store, id: Uuid) {
+        sqlx::query(
+            "UPDATE runs SET available_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1",
+        )
+        .bind(id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    async fn new_run(store: &Store) -> Run {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(1);
+        let mut spec = super::schedule_spec(at);
+        spec.retry = RetryPolicy {
+            max_attempts: 2,
+            initial_delay_seconds: 1,
+            max_delay_seconds: 1,
+        };
+        let schedule = store
+            .create("tenant-a", spec, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        store.claim().await.unwrap().unwrap()
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("accepted".into()),
+        }
+    }
+
+    #[test]
+    fn backoff_is_deterministic_exponential_and_capped() {
+        let policy = RetryPolicy {
+            max_attempts: 100,
+            initial_delay_seconds: 5,
+            max_delay_seconds: 3600,
+        };
+        let id = Uuid::from_u128(1234567);
+        for attempt in 1..=100 {
+            let delay = policy.delay(attempt, id);
+            let base = 5_i64.saturating_mul(1_i64 << (attempt - 1).min(30));
+            assert!(delay >= base.min(3600));
+            assert!(delay <= (base + base / 4).min(3600));
+            assert_eq!(delay, policy.delay(attempt, id));
+        }
+        assert_eq!(policy.delay(100, id), 3600);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn real_http_failure_then_success_keeps_idempotency_key(pool: PgPool) {
+        let received = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let captured = received.clone();
+        let callback = Router::new().route(
+            "/hook",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let mut messages = captured.lock().unwrap();
+                    messages.push((
+                        headers["idempotency-key"].to_str().unwrap().to_owned(),
+                        body,
+                    ));
+                    if messages.len() == 1 {
+                        (StatusCode::SERVICE_UNAVAILABLE, "retry")
+                    } else {
+                        (StatusCode::OK, "accepted")
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, callback).await.unwrap();
+        });
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(1);
+        let mut spec = super::schedule_spec(at);
+        spec.target.url = format!("http://{address}/hook");
+        let schedule = store
+            .create("tenant-a", spec, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        let first = store.claim().await.unwrap().unwrap();
+        let outcome = webhook::deliver(&first, true).await;
+        assert_eq!(outcome.http_status, Some(503));
+        assert!(!outcome.success);
+        let before = store.now().await.unwrap();
+        assert!(store.finish(&first, outcome).await.unwrap());
+        let waiting = get_run(&store, first.id).await;
+        assert_eq!(waiting.status, "pending");
+        assert!(waiting.available_at >= before + chrono::Duration::seconds(5));
+        assert!(waiting.lease_token.is_none());
+        assert!(store.claim().await.unwrap().is_none());
+        make_ready(&store, first.id).await;
+        let second = store.claim().await.unwrap().unwrap();
+        assert_eq!(second.id, first.id);
+        assert_ne!(second.lease_token, first.lease_token);
+        assert!(!store.finish(&first, success()).await.unwrap());
+        let outcome = webhook::deliver(&second, true).await;
+        assert!(outcome.success);
+        assert!(store.finish(&second, outcome).await.unwrap());
+        assert!(!store.finish(&second, success()).await.unwrap());
+        let saved = get_run(&store, first.id).await;
+        assert_eq!(saved.status, "succeeded");
+        assert_eq!(saved.attempt_count, 2);
+        assert!(saved.finished_at.is_some());
+        let attempts: Vec<Attempt> =
+            sqlx::query_as("SELECT * FROM attempts WHERE run_id=$1 ORDER BY number")
+                .bind(first.id)
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| a.status.as_str())
+                .collect::<Vec<_>>(),
+            ["failed", "succeeded"]
+        );
+        assert_eq!(attempts[0].http_status, Some(503));
+        assert_eq!(attempts[1].http_status, Some(200));
+        {
+            let messages = received.lock().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].0, messages[1].0);
+            assert_eq!(messages[0].1["attempt"], 1);
+            assert_eq!(messages[1].1["attempt"], 2);
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn exhausted_retries_preserve_counts_and_reject_expired_leases(pool: PgPool) {
+        let store = Store { pool };
+        let first = new_run(&store).await;
+        assert!(
+            store
+                .finish(&first, DeliveryResult::error("first failure"))
+                .await
+                .unwrap()
+        );
+        make_ready(&store, first.id).await;
+        let second = store.claim().await.unwrap().unwrap();
+        assert!(
+            store
+                .finish(&second, DeliveryResult::error("second failure"))
+                .await
+                .unwrap()
+        );
+        let dead = get_run(&store, first.id).await;
+        assert_eq!(dead.status, "dead");
+        assert_eq!(dead.attempt_count, 2);
+        assert_eq!(dead.cycle_attempts, 2);
+        assert_eq!(dead.last_error.as_deref(), Some("second failure"));
+        assert!(dead.finished_at.is_some());
+        assert!(store.claim().await.unwrap().is_none());
+        let expired = new_run(&store).await;
+        sqlx::query(
+            "UPDATE runs SET lease_until=clock_timestamp()-INTERVAL '1 second' WHERE id=$1",
+        )
+        .bind(expired.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(!store.finish(&expired, success()).await.unwrap());
+        assert_eq!(get_run(&store, expired.id).await.status, "running");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn outcome_failure_rolls_back_attempt_and_run_together(pool: PgPool) {
+        let store = Store { pool };
+        let run = new_run(&store).await;
+        sqlx::query(
+            "ALTER TABLE runs ADD CONSTRAINT reject_test_success CHECK (status <> 'succeeded')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.finish(&run, success()).await.is_err());
+        assert_eq!(get_run(&store, run.id).await.status, "running");
+        let status: String = sqlx::query_scalar("SELECT status FROM attempts WHERE run_id=$1")
+            .bind(run.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        sqlx::query("ALTER TABLE runs DROP CONSTRAINT reject_test_success")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.finish(&run, success()).await.unwrap());
+    }
+}
