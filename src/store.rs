@@ -161,4 +161,44 @@ impl Store {
         tx.commit().await?;
         Ok(updated)
     }
+    pub async fn due_schedules(&self, limit: i64) -> Result<Vec<Schedule>> {
+        Ok(sqlx::query_as("SELECT * FROM schedules WHERE status = 'active' AND next_fire_at <= clock_timestamp() ORDER BY next_fire_at, id LIMIT $1")
+            .bind(limit).fetch_all(&self.pool).await?)
+    }
+    pub async fn materialize(
+        &self,
+        snapshot: &Schedule,
+        dates: &[DateTime<Utc>],
+        next: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let current = Self::lock_schedule(&mut tx, &snapshot.tenant_id, snapshot.id).await?;
+        if current.status != "active"
+            || current.revision != snapshot.revision
+            || current.next_fire_at != snapshot.next_fire_at
+        {
+            return Ok(false);
+        }
+        for date in dates {
+            sqlx::query("INSERT INTO runs (id,schedule_id,tenant_id,revision,scheduled_at,available_at,status,spec) VALUES ($1,$2,$3,$4,$5,$5,'pending',$6) ON CONFLICT (schedule_id,revision,scheduled_at) DO NOTHING")
+                .bind(Uuid::new_v4()).bind(current.id).bind(&current.tenant_id).bind(current.revision)
+                .bind(date).bind(&current.spec).execute(&mut *tx).await?;
+        }
+        let status = if next.is_some() {
+            "active"
+        } else {
+            "completed"
+        };
+        sqlx::query("UPDATE schedules SET next_fire_at = $2, status = $3, last_error = NULL, updated_at = clock_timestamp() WHERE id = $1")
+            .bind(current.id).bind(next).bind(status).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    pub async fn rule_error(&self, snapshot: &Schedule, error: &str) -> Result<()> {
+        sqlx::query("UPDATE schedules SET status = 'error', last_error = $4, updated_at = clock_timestamp()
+            WHERE id = $1 AND revision = $2 AND next_fire_at IS NOT DISTINCT FROM $3 AND status = 'active'")
+            .bind(snapshot.id).bind(snapshot.revision).bind(snapshot.next_fire_at).bind(error)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
 }

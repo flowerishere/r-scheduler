@@ -930,3 +930,175 @@ mod api_tests {
         child.kill().await.unwrap();
     }
 }
+
+mod engine_tests {
+    use super::{evaluator, schedule_spec as spec};
+    use chrono::{DateTime, Utc};
+    use scheduler_service::{
+        domain::{MisfirePolicy, Run, Schedule, Trigger},
+        engine::{materialize_one, scheduler_tick},
+        store::Store,
+    };
+    use sqlx::PgPool;
+    use uuid::Uuid;
+    async fn runs(store: &Store, schedule: Uuid) -> Result<Vec<Run>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM runs WHERE schedule_id=$1 ORDER BY scheduled_at,id")
+            .bind(schedule)
+            .fetch_all(&store.pool)
+            .await
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn atomic_materialization_rejects_stale_cursor(pool: PgPool) {
+        let store = Store { pool };
+        let schedule = create_due(&store).await;
+        let dates = [schedule.next_fire_at.unwrap()];
+        let (first, second) = tokio::join!(
+            store.materialize(&schedule, &dates, None),
+            store.materialize(&schedule, &dates, None)
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let runs = runs(&store, schedule.id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn recurrence_misfire_policies(pool: PgPool) {
+        let store = Store { pool };
+        let now: DateTime<Utc> = "2026-09-21T12:05:30Z".parse().unwrap();
+        let first: DateTime<Utc> = "2026-09-21T12:00:00Z".parse().unwrap();
+        for (policy, expected) in [
+            (MisfirePolicy::Skip, 0),
+            (MisfirePolicy::FireOnce, 1),
+            (MisfirePolicy::CatchUp, 6),
+        ] {
+            let mut spec = spec(first);
+            spec.trigger = Trigger::Cron {
+                expression: "* * * * *".into(),
+                timezone: "UTC".into(),
+            };
+            spec.misfire = policy;
+            let schedule = store
+                .create("tenant-a", spec, first, None, "test")
+                .await
+                .unwrap();
+            materialize_one(&store, &evaluator(), &schedule, now)
+                .await
+                .unwrap();
+            let runs = runs(&store, schedule.id).await.unwrap();
+            assert_eq!(runs.len(), expected, "{policy:?}");
+            let next = store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .next_fire_at
+                .unwrap();
+            assert_eq!(
+                next,
+                "2026-09-21T12:06:00Z".parse::<DateTime<Utc>>().unwrap()
+            );
+        }
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn catch_up_is_bounded_and_keeps_remaining_cursor(pool: PgPool) {
+        let store = Store { pool };
+        let first: DateTime<Utc> = "2026-09-21T12:00:00Z".parse().unwrap();
+        let now = first + chrono::Duration::seconds(150);
+        let mut spec = spec(first);
+        spec.trigger = Trigger::Rrule {
+            value: "DTSTART:20260921T120000Z\nRRULE:FREQ=SECONDLY;COUNT=151".into(),
+        };
+        spec.misfire = MisfirePolicy::CatchUp;
+        let schedule = store
+            .create("tenant-a", spec, first, None, "test")
+            .await
+            .unwrap();
+        materialize_one(&store, &evaluator(), &schedule, now)
+            .await
+            .unwrap();
+        let current = store.get_schedule("tenant-a", schedule.id).await.unwrap();
+        assert_eq!(
+            current.next_fire_at,
+            Some(first + chrono::Duration::seconds(100))
+        );
+        materialize_one(&store, &evaluator(), &current, now)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE schedule_id = $1")
+            .bind(schedule.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 151);
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn scheduler_tick_materializes_due_work_and_marks_invalid_rules(pool: PgPool) {
+        let store = Store { pool };
+        let due = create_due(&store).await;
+        let later = store.now().await.unwrap() + chrono::Duration::hours(1);
+        let future = store
+            .create("tenant-a", spec(later), later, None, "future")
+            .await
+            .unwrap();
+        let mut invalid = spec(due.next_fire_at.unwrap());
+        invalid.trigger = Trigger::Cron {
+            expression: "invalid".into(),
+            timezone: "UTC".into(),
+        };
+        let bad = store
+            .create("tenant-a", invalid, due.next_fire_at.unwrap(), None, "bad")
+            .await
+            .unwrap();
+        scheduler_tick(&store, &evaluator()).await.unwrap();
+        assert_eq!(runs(&store, due.id).await.unwrap().len(), 1);
+        assert!(runs(&store, future.id).await.unwrap().is_empty());
+        let failed = store.get_schedule("tenant-a", bad.id).await.unwrap();
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.next_fire_at, bad.next_fire_at);
+        assert!(failed.last_error.is_some());
+        assert!(
+            !store
+                .materialize(&due, &[due.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        let revised = store
+            .replace("tenant-a", future.id, 1, spec(later), later)
+            .await
+            .unwrap();
+        assert!(!store.materialize(&future, &[later], None).await.unwrap());
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", future.id)
+                .await
+                .unwrap()
+                .revision,
+            revised.revision
+        );
+    }
+}
