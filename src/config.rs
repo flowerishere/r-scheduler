@@ -12,6 +12,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the authenticated HTTP API.
+    Serve,
     /// Apply embedded database migrations.
     Migrate,
     /// Internal isolated rule evaluator. JSON on stdin/stdout.

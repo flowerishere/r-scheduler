@@ -573,3 +573,360 @@ async fn replacement_preserves_pause_rejects_cancellation_and_rolls_back_on_fail
     assert!(run.finished_at.is_none());
     assert!(run.last_error.is_none());
 }
+
+mod api_tests {
+    use super::{evaluator, schedule_spec as spec};
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::Utc;
+    use http_body_util::BodyExt;
+    use scheduler_service::{
+        api::{self, AppState},
+        domain::Trigger,
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+    fn app(store: Store) -> Router {
+        api::router(AppState::new(
+            store,
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ))
+    }
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Value,
+        idempotency: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = idempotency {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body)}));
+        (status, value)
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn api_auth_tenant_isolation_and_idempotent_delay(pool: PgPool) {
+        let store = Store { pool };
+        let app = app(store.clone());
+        assert_eq!(
+            request(&app, "GET", "/v1/schedules", None, Value::Null, None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut spec = spec(Utc::now());
+        spec.trigger = Trigger::Delay { seconds: 30 };
+        let body = serde_json::to_value(&spec).unwrap();
+        let (status, created) = request(
+            &app,
+            "POST",
+            "/v1/schedules",
+            Some("tenant-a-test-secret"),
+            body.clone(),
+            Some("order-42"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["spec"]["trigger"]["type"], "once");
+        let (_, repeated) = request(
+            &app,
+            "POST",
+            "/v1/schedules",
+            Some("tenant-a-test-secret"),
+            body.clone(),
+            Some("order-42"),
+        )
+        .await;
+        assert_eq!(created["id"], repeated["id"]);
+        assert_eq!(created["next_fire_at"], repeated["next_fire_at"]);
+        let mut changed = body;
+        changed["name"] = json!("different request");
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/v1/schedules",
+                Some("tenant-a-test-secret"),
+                changed,
+                Some("order-42")
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let uri = format!("/v1/schedules/{}", created["id"].as_str().unwrap());
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                &uri,
+                Some("tenant-b-test-secret"),
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, list) = request(
+            &app,
+            "GET",
+            "/v1/schedules",
+            Some("tenant-b-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(list, json!([]));
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn preview_endpoint_and_input_validation(pool: PgPool) {
+        let app = app(Store { pool });
+        let body = json!({"trigger": {"type": "cron", "expression": "0 9 * * MON-FRI", "timezone": "Asia/Shanghai"}, "after": "2026-09-21T01:00:00Z", "count": 2});
+        let (status, preview) = request(
+            &app,
+            "POST",
+            "/v1/preview",
+            Some("tenant-a-test-secret"),
+            body,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["dates"][0], "2026-09-22T01:00:00Z");
+        let body = json!({"trigger": {"type": "rrule", "value": "DTSTART:20260921T090000\nRRULE:FREQ=DAILY"}});
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/v1/preview",
+                Some("tenant-a-test-secret"),
+                body,
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let mut invalid = spec(Utc::now());
+        invalid.retry.max_attempts = 0;
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/v1/schedules",
+                Some("tenant-a-test-secret"),
+                serde_json::to_value(invalid).unwrap(),
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        for payload in [
+            json!({"nested": ["bad\u{0000}value"]}),
+            json!({"bad\u{0000}key": true}),
+        ] {
+            let mut invalid = spec(Utc::now());
+            invalid.payload = payload;
+            assert_eq!(
+                request(
+                    &app,
+                    "POST",
+                    "/v1/schedules",
+                    Some("tenant-a-test-secret"),
+                    serde_json::to_value(invalid).unwrap(),
+                    None
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                "/v1/schedules?limit=101",
+                Some("tenant-a-test-secret"),
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn replace_and_validation_do_not_cross_tenant_or_revision_boundaries(pool: PgPool) {
+        let store = Store { pool };
+        let app = app(store.clone());
+        let key = Some("tenant-a-test-secret");
+        let (status, created) = request(
+            &app,
+            "POST",
+            "/v1/schedules",
+            key,
+            serde_json::to_value(spec(Utc::now())).unwrap(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let uri = format!("/v1/schedules/{}", created["id"].as_str().unwrap());
+        let mut replacement = spec(Utc::now());
+        replacement.name = "updated".into();
+        let body = json!({"expected_revision":1,"spec":replacement});
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                &uri,
+                Some("tenant-b-test-secret"),
+                body.clone(),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, updated) = request(&app, "PUT", &uri, key, body.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["revision"], 2);
+        assert_eq!(updated["spec"]["name"], "updated");
+        assert_eq!(
+            request(&app, "PUT", &uri, key, body, None).await.0,
+            StatusCode::CONFLICT
+        );
+        for target in [
+            json!({"url":"file:///etc/passwd"}),
+            json!({"url":"https://user:password@example.invalid/hook"}),
+            json!({"url":"https://example.invalid/hook","headers":{"Idempotency-Key":"override"}}),
+        ] {
+            let mut invalid = serde_json::to_value(spec(Utc::now())).unwrap();
+            invalid["target"] = target;
+            assert_eq!(
+                request(&app, "POST", "/v1/schedules", key, invalid, None)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            store
+                .list_schedules("tenant-a", 100, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            request(&app, "GET", "/health", None, Value::Null, None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&app, "GET", "/ready", None, Value::Null, None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn serve_command_exposes_the_authenticated_api_on_tcp(pool: PgPool) {
+        use sqlx::ConnectOptions;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+            .arg("serve")
+            .env_clear()
+            .env(
+                "DATABASE_URL",
+                pool.connect_options().to_url_lossy().as_str(),
+            )
+            .env("SCHEDULER_BIND", address.to_string())
+            .env(
+                "SCHEDULER_API_KEYS",
+                r#"{"tenant-a":"tenant-a-test-secret"}"#,
+            )
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "serve exited before becoming ready"
+                );
+                if let Ok(response) = client.get(format!("http://{address}/ready")).send().await
+                    && response.status().is_success()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let url = format!("http://{address}/v1/schedules");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = client
+            .post(&url)
+            .bearer_auth("tenant-a-test-secret")
+            .json(&spec(Utc::now()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schedules WHERE tenant_id='tenant-a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        child.kill().await.unwrap();
+    }
+}
