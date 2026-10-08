@@ -185,3 +185,22 @@ mod tests {
         );
     }
 }
+
+#[derive(Debug)]
+pub struct DeliveryResult {
+    pub success: bool,
+    pub http_status: Option<i32>,
+    pub error: Option<String>,
+    pub response_excerpt: Option<String>,
+}
+
+impl DeliveryResult {
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            http_status: None,
+            error: Some(message.into()),
+            response_excerpt: None,
+        }
+    }
+}

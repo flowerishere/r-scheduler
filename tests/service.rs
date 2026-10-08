@@ -1241,3 +1241,108 @@ mod claim_tests {
         assert!(store.claim().await.unwrap().is_some());
     }
 }
+
+mod webhook_tests {
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+    use scheduler_service::{domain::Run, store::Store, webhook};
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::sync::{Arc, Mutex};
+
+    async fn run(store: &Store, url: String) -> Run {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(1);
+        let mut spec = super::schedule_spec(at);
+        spec.target.url = url;
+        spec.target.timeout_seconds = 1;
+        spec.target
+            .headers
+            .insert("x-callback-secret".into(), "test-only".into());
+        let schedule = store
+            .create("tenant-a", spec, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        store.claim().await.unwrap().unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn real_callbacks_preserve_envelopes_and_bound_network_behavior(pool: PgPool) {
+        let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let received = captured.clone();
+        let callback = Router::new()
+            .route(
+                "/hook",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let received = received.clone();
+                    async move {
+                        received.lock().unwrap().push((headers, body));
+                        "accepted"
+                    }
+                }),
+            )
+            .route(
+                "/redirect",
+                post(|| async { (StatusCode::FOUND, [("location", "/hook")], "redirect") }),
+            )
+            .route("/large", post(|| async { "x".repeat(10_000) }))
+            .route(
+                "/slow",
+                post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    "late"
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, callback).await.unwrap();
+        });
+        let store = Store { pool };
+        let mut delivery = run(&store, format!("http://{address}/hook")).await;
+        let denied = webhook::deliver(&delivery, false).await;
+        assert!(!denied.success);
+        assert!(denied.error.unwrap().contains("Private/reserved"));
+        assert!(captured.lock().unwrap().is_empty());
+        let accepted = webhook::deliver(&delivery, true).await;
+        assert!(accepted.success);
+        assert_eq!(accepted.http_status, Some(200));
+        assert_eq!(accepted.response_excerpt.as_deref(), Some("accepted"));
+        delivery.attempt_count = 2;
+        assert!(webhook::deliver(&delivery, true).await.success);
+        {
+            let messages = captured.lock().unwrap();
+            assert_eq!(messages.len(), 2);
+            for (i, (headers, body)) in messages.iter().enumerate() {
+                assert_eq!(headers["idempotency-key"], delivery.id.to_string());
+                assert_eq!(headers["x-scheduler-run-id"], delivery.id.to_string());
+                assert_eq!(headers["x-callback-secret"], "test-only");
+                assert_eq!(headers["x-scheduler-attempt"], (i + 1).to_string());
+                assert_eq!(body["run_id"], json!(delivery.id));
+                assert_eq!(body["schedule_id"], json!(delivery.schedule_id));
+                assert_eq!(body["revision"], delivery.revision);
+                assert_eq!(body["scheduled_at"], json!(delivery.scheduled_at));
+                assert_eq!(body["payload"], delivery.spec.payload);
+            }
+        }
+        delivery.spec.0.target.url = format!("http://{address}/redirect");
+        let redirect = webhook::deliver(&delivery, true).await;
+        assert_eq!(redirect.http_status, Some(302));
+        assert!(!redirect.success);
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        delivery.spec.0.target.url = format!("http://{address}/large");
+        let large = webhook::deliver(&delivery, true).await;
+        assert!(large.success);
+        assert_eq!(large.response_excerpt.unwrap().len(), 4096);
+        delivery.spec.0.target.url = format!("http://{address}/slow");
+        let started = std::time::Instant::now();
+        assert!(!webhook::deliver(&delivery, true).await.success);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        server.abort();
+        let _ = server.await;
+    }
+}
