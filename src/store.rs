@@ -430,4 +430,61 @@ impl Store {
         tx.commit().await?;
         Ok(result.rows_affected())
     }
+    pub async fn cleanup_history(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+        apply: bool,
+    ) -> Result<CleanupReport> {
+        if !(1..=10_000).contains(&limit) || cutoff >= self.now().await? {
+            return Err(StoreError::Conflict(
+                "Cleanup requires a past cutoff and batch size 1..10000".into(),
+            ));
+        }
+        let eligible_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE status IN ('succeeded', 'dead', 'cancelled') AND finished_at < $1")
+            .bind(cutoff).fetch_one(&self.pool).await?;
+        let mut report = CleanupReport {
+            cutoff,
+            dry_run: !apply,
+            eligible_runs,
+            deleted_runs: 0,
+            deleted_attempts: 0,
+        };
+        if !apply || eligible_runs == 0 {
+            return Ok(report);
+        }
+        let mut tx = self.pool.begin().await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT r.id FROM runs r JOIN schedules s ON s.id = r.schedule_id
+            WHERE r.status IN ('succeeded', 'dead', 'cancelled') AND r.finished_at < $1
+            ORDER BY r.finished_at, r.id LIMIT $2 FOR UPDATE OF s SKIP LOCKED",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        report.deleted_attempts = sqlx::query_scalar("SELECT COUNT(*) FROM attempts a JOIN runs r ON r.id = a.run_id
+            WHERE r.id = ANY($1) AND r.status IN ('succeeded', 'dead', 'cancelled') AND r.finished_at < $2")
+            .bind(&ids).bind(cutoff).fetch_one(&mut *tx).await?;
+        report.deleted_runs = sqlx::query(
+            "DELETE FROM runs WHERE id = ANY($1)
+            AND status IN ('succeeded', 'dead', 'cancelled') AND finished_at < $2",
+        )
+        .bind(ids)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(report)
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CleanupReport {
+    pub cutoff: DateTime<Utc>,
+    pub dry_run: bool,
+    pub eligible_runs: i64,
+    pub deleted_runs: u64,
+    pub deleted_attempts: i64,
 }

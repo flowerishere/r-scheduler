@@ -133,10 +133,12 @@ def main():
         assert dead["attempt_count"] == 0
         with lock:
             assert len(requests) == 2
+        report = json.loads(docker("exec", service, "scheduler-service", "cleanup").stdout)
+        assert report["dry_run"] and report["deleted_runs"] == 0
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, stable idempotency key, graceful shutdown")
+        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, stable idempotency key, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)

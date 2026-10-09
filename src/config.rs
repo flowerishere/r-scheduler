@@ -19,6 +19,15 @@ pub enum Command {
     },
     /// Apply embedded database migrations.
     Migrate,
+    /// Preview old terminal run history; pass --apply to delete one bounded batch.
+    Cleanup {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=36500))]
+        older_than_days: u32,
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        batch_size: u32,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Internal isolated rule evaluator. JSON on stdin/stdout.
     #[command(hide = true)]
     Evaluate,

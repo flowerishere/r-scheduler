@@ -2721,3 +2721,291 @@ mod expiry_api_tests {
         assert!(saved.spec.retry.max_age_seconds.is_none());
     }
 }
+
+mod cleanup_tests {
+    use chrono::{DateTime, Utc};
+    use scheduler_service::{
+        domain::{
+            ConcurrencyPolicy, DeliveryResult, HttpTarget, MisfirePolicy, RetryPolicy, Schedule,
+            ScheduleSpec, Trigger,
+        },
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::{collections::BTreeMap, time::Duration};
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("ok".into()),
+            retry_after: None,
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn cleanup_is_bounded_preserves_idempotency_and_defaults_to_preview(pool: PgPool) {
+        use sqlx::ConnectOptions;
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        let schedule = store
+            .create(
+                "tenant-a",
+                spec(at),
+                at,
+                Some("retained-key"),
+                "original-hash",
+            )
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        let first = store.claim().await.unwrap().unwrap();
+        store.finish(&first, success()).await.unwrap();
+        create_run(&store).await;
+        let second = store.claim().await.unwrap().unwrap();
+        store.finish(&second, success()).await.unwrap();
+        create_run(&store).await; // This pending run must survive cleanup.
+        sqlx::query("UPDATE runs SET finished_at = clock_timestamp() - INTERVAL '40 days' WHERE status = 'succeeded'")
+        .execute(&store.pool).await.unwrap();
+        let cutoff = store.now().await.unwrap() - chrono::Duration::days(30);
+        let preview = store.cleanup_history(cutoff, 1, false).await.unwrap();
+        assert_eq!(preview.eligible_runs, 2);
+        assert_eq!(preview.deleted_runs, 0);
+        assert!(preview.dry_run);
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+            .args(["cleanup", "--older-than-days", "30"])
+            .env_clear()
+            .env(
+                "DATABASE_URL",
+                store.pool.connect_options().to_url_lossy().as_str(),
+            )
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["eligible_runs"], 2);
+        let report = store.cleanup_history(cutoff, 1, true).await.unwrap();
+        assert_eq!(report.deleted_runs, 1);
+        assert_eq!(report.deleted_attempts, 1);
+        assert_eq!(
+            store
+                .cleanup_history(cutoff, 1, true)
+                .await
+                .unwrap()
+                .deleted_runs,
+            1
+        );
+        assert_eq!(
+            store
+                .cleanup_history(cutoff, 1, true)
+                .await
+                .unwrap()
+                .deleted_runs,
+            0
+        );
+        assert_eq!(
+            store
+                .find_idempotent("tenant-a", "retained-key", "original-hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            schedule.id
+        );
+        assert_eq!(
+            store
+                .list_runs("tenant-a", None, None, 100, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!store.finish(&first, success()).await.unwrap());
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attempts")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn cleanup_skips_locked_parents_and_preserves_replayed_work(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        let mut job = spec(at);
+        job.retry.max_attempts = 1;
+        let schedule = store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        let run = store.claim().await.unwrap().unwrap();
+        store
+            .finish(&run, DeliveryResult::error("failed"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE runs SET finished_at = clock_timestamp() - INTERVAL '40 days' WHERE id = $1",
+        )
+        .bind(run.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let cutoff = store.now().await.unwrap() - chrono::Duration::days(30);
+        let mut tx = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
+            .bind(schedule.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let report = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.cleanup_history(cutoff, 100, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.eligible_runs, 1);
+        assert_eq!(report.deleted_runs, 0);
+        tx.commit().await.unwrap();
+        store.replay("tenant-a", run.id).await.unwrap();
+        assert_eq!(
+            store
+                .cleanup_history(cutoff, 100, true)
+                .await
+                .unwrap()
+                .deleted_runs,
+            0
+        );
+        assert_eq!(
+            store.get_run("tenant-a", run.id).await.unwrap().status,
+            "pending"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn cleanup_cli_apply_and_invalid_arguments_are_bounded(pool: PgPool) {
+        use sqlx::ConnectOptions;
+        let store = Store { pool };
+        create_run(&store).await;
+        let run = store.claim().await.unwrap().unwrap();
+        store.finish(&run, success()).await.unwrap();
+        sqlx::query("UPDATE runs SET finished_at=clock_timestamp()-INTERVAL '40 days'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let cutoff = store.now().await.unwrap() - chrono::Duration::days(30);
+        assert!(store.cleanup_history(cutoff, 0, true).await.is_err());
+        assert!(
+            store
+                .cleanup_history(
+                    store.now().await.unwrap() + chrono::Duration::days(1),
+                    1,
+                    true
+                )
+                .await
+                .is_err()
+        );
+        for args in [
+            vec!["cleanup", "--batch-size", "0"],
+            vec!["cleanup", "--older-than-days", "0"],
+        ] {
+            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+                .args(args)
+                .env_clear()
+                .env(
+                    "DATABASE_URL",
+                    store.pool.connect_options().to_url_lossy().as_str(),
+                )
+                .output()
+                .await
+                .unwrap();
+            assert!(!output.status.success());
+        }
+        assert_eq!(
+            store
+                .cleanup_history(cutoff, 1, false)
+                .await
+                .unwrap()
+                .eligible_runs,
+            1
+        );
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+            .args(["cleanup", "--apply", "--batch-size", "1"])
+            .env_clear()
+            .env(
+                "DATABASE_URL",
+                store.pool.connect_options().to_url_lossy().as_str(),
+            )
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["dry_run"], false);
+        assert_eq!(report["deleted_runs"], 1);
+        assert_eq!(report["deleted_attempts"], 1);
+        assert_eq!(
+            store.list_schedules("tenant-a", 10, 0).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .cleanup_history(cutoff, 1, false)
+                .await
+                .unwrap()
+                .eligible_runs,
+            0
+        );
+    }
+}

@@ -49,6 +49,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return Ok(());
         }
         Command::Evaluate => unreachable!(),
+        Command::Cleanup {
+            older_than_days,
+            batch_size,
+            apply,
+        } => {
+            let store = Store::connect(&config.database_url).await?;
+            let cutoff = store.now().await? - chrono::Duration::days(i64::from(older_than_days));
+            let report = store
+                .cleanup_history(cutoff, i64::from(batch_size), apply)
+                .await?;
+            println!("{}", serde_json::to_string(&report)?);
+            store.pool.close().await;
+            return Ok(());
+        }
     };
     let api_enabled = matches!(role, Role::All | Role::Api);
     if api_enabled && config.api_keys.is_empty() {
