@@ -44,6 +44,9 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub initial_delay_seconds: u32,
     pub max_delay_seconds: u32,
+    /// No new attempt may start after scheduled_at + max_age_seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u32>,
 }
 
 impl Default for RetryPolicy {
@@ -52,6 +55,7 @@ impl Default for RetryPolicy {
             max_attempts: 5,
             initial_delay_seconds: 5,
             max_delay_seconds: 3600,
+            max_age_seconds: None,
         }
     }
 }
@@ -120,6 +124,7 @@ pub struct Run {
     pub revision: i64,
     pub scheduled_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
     pub status: String,
     pub attempt_count: i32,
     pub cycle_attempts: i32,
@@ -156,6 +161,7 @@ mod tests {
     fn default_retry_serialization_preserves_existing_idempotency_hashes() {
         let old = r#"{"max_attempts":5,"initial_delay_seconds":5,"max_delay_seconds":3600}"#;
         let retry: RetryPolicy = serde_json::from_str(old).unwrap();
+        assert_eq!(retry.max_age_seconds, None);
         assert_eq!(serde_json::to_string(&retry).unwrap(), old);
     }
 
@@ -192,6 +198,7 @@ pub struct DeliveryResult {
     pub http_status: Option<i32>,
     pub error: Option<String>,
     pub response_excerpt: Option<String>,
+    pub retry_after: Option<RetryAfter>,
 }
 
 impl DeliveryResult {
@@ -201,6 +208,7 @@ impl DeliveryResult {
             http_status: None,
             error: Some(message.into()),
             response_excerpt: None,
+            retry_after: None,
         }
     }
 }
@@ -212,5 +220,61 @@ impl RetryPolicy {
         let jitter = (run_id.as_u128() as u64).wrapping_add(attempt as u64 * 31) % (base / 4 + 1);
         base.saturating_add(jitter)
             .min(u64::from(self.max_delay_seconds)) as i64
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryAfter {
+    Seconds(u64),
+    At(DateTime<Utc>),
+}
+
+impl RetryAfter {
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(Self::Seconds(value.parse().unwrap_or(u64::MAX)));
+        }
+        httpdate::parse_http_date(value)
+            .ok()
+            .map(|date| Self::At(date.into()))
+    }
+
+    pub fn delay(&self, now: DateTime<Utc>, cap: u32) -> i64 {
+        let seconds = match self {
+            Self::Seconds(seconds) => *seconds,
+            Self::At(date) => {
+                let remaining = date.signed_duration_since(now);
+                // Round up so a fractional second cannot start the retry early.
+                remaining.num_seconds().max(0) as u64
+                    + u64::from(
+                        remaining > chrono::Duration::zero() && remaining.subsec_nanos() > 0,
+                    )
+            }
+        };
+        seconds.min(u64::from(cap)) as i64
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+    #[test]
+    fn retry_after_accepts_dates_and_seconds_with_bounded_waits() {
+        let now: DateTime<Utc> = "2026-09-21T12:00:00.100Z".parse().unwrap();
+        assert_eq!(RetryAfter::parse(" 7 "), Some(RetryAfter::Seconds(7)));
+        let date = RetryAfter::parse("Mon, 21 Sep 2026 12:00:08 GMT").unwrap();
+        assert_eq!(date.delay(now, 60), 8);
+        assert_eq!(date.delay(now, 5), 5);
+        assert_eq!(date.delay(now + chrono::Duration::seconds(9), 60), 0);
+        assert_eq!(
+            RetryAfter::parse("9999999999999999999999999")
+                .unwrap()
+                .delay(now, 60),
+            60
+        );
+        for invalid in ["", "-1", "+1", "1.5", "tomorrow"] {
+            assert_eq!(RetryAfter::parse(invalid), None);
+        }
     }
 }

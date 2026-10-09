@@ -180,9 +180,26 @@ impl Store {
             return Ok(false);
         }
         for date in dates {
-            sqlx::query("INSERT INTO runs (id,schedule_id,tenant_id,revision,scheduled_at,available_at,status,spec) VALUES ($1,$2,$3,$4,$5,$5,'pending',$6) ON CONFLICT (schedule_id,revision,scheduled_at) DO NOTHING")
+            let expires_at = current
+                .spec
+                .retry
+                .max_age_seconds
+                .map(|age| {
+                    date.checked_add_signed(Duration::seconds(i64::from(age)))
+                        .ok_or_else(|| {
+                            StoreError::Conflict(
+                                "Run deadline exceeds the supported date range".into(),
+                            )
+                        })
+                })
+                .transpose()?;
+            sqlx::query("INSERT INTO runs (id,schedule_id,tenant_id,revision,scheduled_at,available_at,status,spec,expires_at,finished_at,last_error)
+                VALUES ($1,$2,$3,$4,$5,$5,CASE WHEN $7::timestamptz <= statement_timestamp() THEN 'dead' ELSE 'pending' END,$6,$7,
+                CASE WHEN $7 <= statement_timestamp() THEN statement_timestamp() END,
+                CASE WHEN $7 <= statement_timestamp() THEN 'Run admission deadline expired' END)
+                ON CONFLICT (schedule_id,revision,scheduled_at) DO NOTHING")
                 .bind(Uuid::new_v4()).bind(current.id).bind(&current.tenant_id).bind(current.revision)
-                .bind(date).bind(&current.spec).execute(&mut *tx).await?;
+                .bind(date).bind(&current.spec).bind(expires_at).execute(&mut *tx).await?;
         }
         let status = if next.is_some() {
             "active"
@@ -233,13 +250,22 @@ impl Store {
             return Ok(false);
         }
         let obsolete = schedule.status == "cancelled" || schedule.revision != current.revision;
-        let delay = current.spec.retry.delay(current.cycle_attempts, current.id);
+        let delay = current
+            .spec
+            .retry
+            .delay(current.cycle_attempts, current.id)
+            .max(outcome.retry_after.as_ref().map_or(0, |hint| {
+                hint.delay(now, current.spec.retry.max_delay_seconds)
+            }));
         let retry_at = now + Duration::seconds(delay);
+        let deadline_reached = current.expires_at.is_some_and(|end| retry_at >= end);
         let status = if outcome.success {
             "succeeded"
         } else if obsolete {
             "cancelled"
-        } else if current.cycle_attempts >= current.spec.retry.max_attempts as i32 {
+        } else if deadline_reached
+            || current.cycle_attempts >= current.spec.retry.max_attempts as i32
+        {
             "dead"
         } else {
             "pending"
@@ -260,7 +286,11 @@ impl Store {
             current.available_at
         };
         let finished = if status == "pending" { None } else { Some(now) };
-        let last_error = outcome.error;
+        let last_error = if status == "dead" && deadline_reached {
+            Some("No retry fits before the run admission deadline".to_owned())
+        } else {
+            outcome.error
+        };
         sqlx::query("UPDATE runs SET status = $2, available_at = $3, lease_token = NULL, lease_until = NULL, last_error = $4, finished_at = $5 WHERE id = $1")
             .bind(current.id).bind(status).bind(available).bind(last_error).bind(finished)
             .execute(&mut **tx).await?;
@@ -359,9 +389,9 @@ impl Store {
                 "Cannot replay a cancelled or superseded schedule revision".into(),
             ));
         }
-        let run = sqlx::query_as("UPDATE runs SET status = 'pending', cycle_attempts = 0, available_at = clock_timestamp(), finished_at = NULL WHERE id = $1 AND status = 'dead' RETURNING *")
+        let run = sqlx::query_as("UPDATE runs SET status = 'pending', cycle_attempts = 0, available_at = clock_timestamp(), finished_at = NULL WHERE id = $1 AND status = 'dead' AND (expires_at IS NULL OR expires_at > clock_timestamp()) RETURNING *")
             .bind(id).fetch_optional(&mut *tx).await?
-            .ok_or_else(|| StoreError::Conflict("Only dead runs can be replayed".into()))?;
+            .ok_or_else(|| StoreError::Conflict("Only dead runs with an unexpired admission deadline can be replayed".into()))?;
         tx.commit().await?;
         Ok(run)
     }
@@ -382,5 +412,22 @@ impl Store {
             "schedules": schedule_counts.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
             "runs": run_counts.into_iter().collect::<std::collections::BTreeMap<_, _>>()
         }))
+    }
+    pub async fn expire_pending(&self) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        // Select and lock parents before applying LIMIT, as in lease recovery.
+        // Locked plans must not consume the entire maintenance batch.
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT r.id FROM runs r JOIN schedules s ON s.id = r.schedule_id
+             WHERE r.status = 'pending' AND r.expires_at <= statement_timestamp()
+             ORDER BY r.expires_at, r.id LIMIT 100 FOR UPDATE OF s SKIP LOCKED",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let result = sqlx::query("UPDATE runs SET status = 'dead', finished_at = statement_timestamp(), last_error = 'Run admission deadline expired'
+            WHERE id = ANY($1) AND status = 'pending' AND expires_at <= statement_timestamp()")
+            .bind(ids).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 }

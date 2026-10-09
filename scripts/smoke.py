@@ -112,7 +112,7 @@ def main():
         job = {"name": "container smoke", "trigger": {"type": "delay", "seconds": 1},
                "target": {"url": f"http://host.docker.internal:{receiver.server_port}/hook"},
                "retry": {"max_attempts": 3, "initial_delay_seconds": 1,
-                         "max_delay_seconds": 5}}
+                         "max_delay_seconds": 5, "max_age_seconds": 120}}
         created = api("/v1/schedules", job, idempotency="smoke-job")
         assert api("/v1/schedules", job, idempotency="smoke-job")["id"] == created["id"]
         def finished(schedule_id, status):
@@ -125,11 +125,18 @@ def main():
         with lock:
             assert len(requests) == 2
             assert requests[0][1] == requests[1][1] == run["id"]
-            assert requests[1][0] - requests[0][0] >= 1
+            assert requests[1][0] - requests[0][0] >= 2
+        job["trigger"] = {"type": "once", "at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).isoformat()}
+        job["retry"]["max_age_seconds"] = 1
+        expired = api("/v1/schedules", job)
+        dead = eventually(lambda: finished(expired["id"], "dead"))
+        assert dead["attempt_count"] == 0
+        with lock:
+            assert len(requests) == 2
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, RRULE preview, delayed callback, retry, stable idempotency key, graceful shutdown")
+        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, stable idempotency key, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)

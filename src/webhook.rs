@@ -11,7 +11,7 @@ use reqwest::{
 };
 use url::{Host, Url};
 
-use crate::domain::{DeliveryResult, HttpTarget, Run, ScheduleSpec};
+use crate::domain::{DeliveryResult, HttpTarget, RetryAfter, Run, ScheduleSpec};
 
 pub fn validate_spec(spec: &ScheduleSpec) -> anyhow::Result<()> {
     if contains_nul(&serde_json::to_value(spec)?) {
@@ -32,6 +32,13 @@ pub fn validate_spec(spec: &ScheduleSpec) -> anyhow::Result<()> {
     }
     if spec.misfire_grace_seconds > 86400 {
         bail!("misfire_grace_seconds must be <= 86400");
+    }
+    if spec
+        .retry
+        .max_age_seconds
+        .is_some_and(|age| !(1..=31_536_000).contains(&age))
+    {
+        bail!("retry.max_age_seconds must be 1..31536000 when provided");
     }
     validate_target(&spec.target)?;
     Ok(())
@@ -143,6 +150,17 @@ pub async fn deliver(run: &Run, allow_private: bool) -> DeliveryResult {
         Err(_) => return DeliveryResult::error("HTTP delivery timed out"),
     };
     let status = response.status();
+    let retry_after = if matches!(status.as_u16(), 429 | 503) {
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(RetryAfter::parse)
+    } else {
+        None
+    };
+    // Once headers arrive, retain their status and retry hints even if the
+    // diagnostic body is interrupted. Both phases share one total deadline.
     let mut excerpt = Vec::new();
     let read_body = async {
         while excerpt.len() < 4096 {
@@ -165,6 +183,7 @@ pub async fn deliver(run: &Run, allow_private: bool) -> DeliveryResult {
         error: body_error
             .or_else(|| (!status.is_success()).then(|| format!("HTTP {}", status.as_u16()))),
         response_excerpt: Some(String::from_utf8_lossy(&excerpt).replace('\0', "")),
+        retry_after,
     }
 }
 async fn send(run: &Run, allow_private: bool) -> anyhow::Result<reqwest::Response> {

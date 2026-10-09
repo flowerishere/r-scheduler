@@ -72,7 +72,7 @@ async fn migrate_command_and_store_apply_initial_schema_idempotently(pool: sqlx:
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions, [1]);
+    assert_eq!(versions, [1, 2]);
     let store = Store::connect(&url).await.unwrap();
     let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
         .fetch_one(&store.pool)
@@ -1386,6 +1386,7 @@ mod retry_tests {
             max_attempts: 2,
             initial_delay_seconds: 1,
             max_delay_seconds: 1,
+            max_age_seconds: None,
         };
         let schedule = store
             .create("tenant-a", spec, at, None, "test")
@@ -1400,6 +1401,7 @@ mod retry_tests {
             http_status: Some(200),
             error: None,
             response_excerpt: Some("accepted".into()),
+            retry_after: None,
         }
     }
 
@@ -1409,6 +1411,7 @@ mod retry_tests {
             max_attempts: 100,
             initial_delay_seconds: 5,
             max_delay_seconds: 3600,
+            max_age_seconds: None,
         };
         let id = Uuid::from_u128(1234567);
         for attempt in 1..=100 {
@@ -1629,6 +1632,7 @@ mod runtime_tests {
                 max_attempts: 3,
                 initial_delay_seconds: 1,
                 max_delay_seconds: 10,
+                max_age_seconds: None,
             },
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
@@ -1641,6 +1645,7 @@ mod runtime_tests {
             http_status: Some(200),
             error: None,
             response_excerpt: Some("ok".into()),
+            retry_after: None,
         }
     }
     async fn create_due(store: &Store) -> Schedule {
@@ -1988,6 +1993,7 @@ mod lifecycle_tests {
                 max_attempts: 3,
                 initial_delay_seconds: 1,
                 max_delay_seconds: 10,
+                max_age_seconds: None,
             },
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
@@ -2000,6 +2006,7 @@ mod lifecycle_tests {
             http_status: Some(200),
             error: None,
             response_excerpt: Some("ok".into()),
+            retry_after: None,
         }
     }
     async fn create_due(store: &Store) -> Schedule {
@@ -2295,5 +2302,422 @@ mod lifecycle_tests {
             .0,
             StatusCode::CONFLICT
         );
+    }
+}
+
+mod expiry_tests {
+    use chrono::{DateTime, Utc};
+    use scheduler_service::{
+        domain::{
+            ConcurrencyPolicy, DeliveryResult, HttpTarget, MisfirePolicy, RetryAfter, RetryPolicy,
+            Schedule, ScheduleSpec, Trigger,
+        },
+        store::{Store, StoreError},
+        webhook,
+    };
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("ok".into()),
+            retry_after: None,
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    async fn make_ready(store: &Store, run_id: Uuid) {
+        sqlx::query(
+            "UPDATE runs SET available_at = clock_timestamp() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn admission_deadline_rejects_old_and_paused_pending_runs(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        let mut job = spec(at);
+        job.retry.max_age_seconds = Some(1);
+        let schedule = store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        let run = store
+            .list_runs("tenant-a", Some(schedule.id), None, 1, 0)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.expires_at, Some(at + chrono::Duration::seconds(1)));
+        assert_eq!(run.status, "dead");
+        assert_eq!(run.attempt_count, 0);
+        assert!(store.claim().await.unwrap().is_none());
+        assert!(matches!(
+            store.replay("tenant-a", run.id).await,
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut job = spec(at);
+        job.retry.max_age_seconds = Some(60);
+        let schedule = store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&schedule, &[at], None).await.unwrap();
+        store
+            .transition("tenant-a", schedule.id, "pause")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE schedule_id = $1")
+        .bind(schedule.id).execute(&store.pool).await.unwrap();
+        // Resuming cannot admit expired work, even before the maintenance pass.
+        store
+            .transition("tenant-a", schedule.id, "resume")
+            .await
+            .unwrap();
+        assert!(store.claim().await.unwrap().is_none());
+        store
+            .transition("tenant-a", schedule.id, "pause")
+            .await
+            .unwrap();
+        assert_eq!(store.expire_pending().await.unwrap(), 1);
+        assert_eq!(store.expire_pending().await.unwrap(), 0);
+        let run = store
+            .list_runs("tenant-a", Some(schedule.id), None, 1, 0)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "dead");
+        assert!(store.attempts("tenant-a", run.id).await.unwrap().is_empty());
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn admitted_requests_may_finish_but_retries_must_fit_deadline(pool: PgPool) {
+        let store = Store { pool };
+        create_run(&store).await;
+        let first = store.claim().await.unwrap().unwrap();
+        sqlx::query(
+            "UPDATE runs SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(store.expire_pending().await.unwrap(), 0);
+        assert!(store.finish(&first, success()).await.unwrap());
+        assert_eq!(
+            store.get_run("tenant-a", first.id).await.unwrap().status,
+            "succeeded"
+        );
+
+        create_run(&store).await;
+        let second = store.claim().await.unwrap().unwrap();
+        sqlx::query(
+            "UPDATE runs SET expires_at = clock_timestamp() + INTERVAL '5 seconds' WHERE id = $1",
+        )
+        .bind(second.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let mut outcome = DeliveryResult::error("HTTP 429");
+        outcome.http_status = Some(429);
+        outcome.retry_after = Some(RetryAfter::Seconds(20));
+        store.finish(&second, outcome).await.unwrap();
+        let dead = store.get_run("tenant-a", second.id).await.unwrap();
+        assert_eq!(dead.status, "dead");
+        assert!(dead.last_error.unwrap().contains("deadline"));
+        assert_eq!(
+            store.attempts("tenant-a", dead.id).await.unwrap()[0]
+                .error
+                .as_deref(),
+            Some("HTTP 429")
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn retry_after_is_capped_and_expired_leases_respect_deadline(pool: PgPool) {
+        let store = Store { pool };
+        create_run(&store).await;
+        let run = store.claim().await.unwrap().unwrap();
+        let mut outcome = DeliveryResult::error("HTTP 503");
+        outcome.retry_after = Some(RetryAfter::At(
+            store.now().await.unwrap() + chrono::Duration::hours(1),
+        ));
+        let before = store.now().await.unwrap();
+        store.finish(&run, outcome).await.unwrap();
+        let current = store.get_run("tenant-a", run.id).await.unwrap();
+        let after = store.now().await.unwrap();
+        assert!(current.available_at >= before + chrono::Duration::seconds(10));
+        assert!(current.available_at <= after + chrono::Duration::seconds(10));
+        make_ready(&store, run.id).await;
+        let running = store.claim().await.unwrap().unwrap();
+        sqlx::query("UPDATE runs SET expires_at = clock_timestamp() - INTERVAL '1 second', lease_until = clock_timestamp() - INTERVAL '1 second' WHERE id = $1")
+        .bind(running.id).execute(&store.pool).await.unwrap();
+        assert_eq!(store.recover_expired().await.unwrap(), 1);
+        assert_eq!(
+            store.get_run("tenant-a", run.id).await.unwrap().status,
+            "dead"
+        );
+        assert!(!store.finish(&running, success()).await.unwrap());
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn incomplete_callback_bodies_preserve_status_and_retry_after(pool: PgPool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let store = Store { pool };
+        for (status, stall) in [(503, false), (429, true), (200, false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                let mut buffer = [0; 4096];
+                // Consume the POST before responding, so closing the socket does not
+                // discard the response due to unread request bytes.
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    received.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if received.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nRetry-After: 7\r\nConnection: close\r\n\r\npartial").as_bytes()).await.unwrap();
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+            });
+            let at = store.now().await.unwrap() - chrono::Duration::seconds(1);
+            let mut spec = spec(at);
+            spec.target.url = format!("http://{address}/hook");
+            let schedule = store
+                .create("tenant-a", spec, at, None, "test")
+                .await
+                .unwrap();
+            store.materialize(&schedule, &[at], None).await.unwrap();
+            let run = store.claim().await.unwrap().unwrap();
+            let result = webhook::deliver(&run, true).await;
+            server.abort();
+            assert!(
+                !result.success,
+                "incomplete bodies remain delivery failures"
+            );
+            assert_eq!(result.http_status, Some(status));
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("response body"))
+            );
+            if status != 200 {
+                assert_eq!(result.retry_after, Some(RetryAfter::Seconds(7)));
+            } else {
+                assert_eq!(result.retry_after, None);
+            }
+            assert!(store.finish(&run, result).await.unwrap());
+            let waiting = store.get_run("tenant-a", run.id).await.unwrap();
+            assert_eq!(waiting.status, "pending");
+            if status != 200 {
+                assert!(
+                    waiting.available_at
+                        > store.now().await.unwrap() + chrono::Duration::seconds(6)
+                );
+            }
+            assert_eq!(
+                store.attempts("tenant-a", run.id).await.unwrap()[0].http_status,
+                Some(status)
+            );
+            store
+                .transition("tenant-a", schedule.id, "cancel")
+                .await
+                .unwrap();
+        }
+    }
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn operations_migration_preserves_existing_schedules_and_runs(pool: PgPool) {
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = Store { pool };
+        let schedule = create_due(&store).await;
+        let run_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO runs (id, schedule_id, tenant_id, revision, scheduled_at, available_at, status, spec) VALUES ($1, $2, 'tenant-a', 1, $3, $3, 'pending', $4)")
+        .bind(run_id).bind(schedule.id).bind(schedule.next_fire_at).bind(&schedule.spec).execute(&store.pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0002_operations.sql"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_schedules("tenant-a", 10, 0).await.unwrap().len(),
+            1
+        );
+        let run = store.claim().await.unwrap().unwrap();
+        assert_eq!(run.id, run_id);
+        assert!(run.expires_at.is_none());
+        assert!(run.spec.retry.max_age_seconds.is_none());
+        store.finish(&run, success()).await.unwrap();
+        assert_eq!(
+            store.get_run("tenant-a", run_id).await.unwrap().status,
+            "succeeded"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn deadline_overflow_rolls_back_every_run_and_the_cursor(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap();
+        let mut job = spec(at);
+        job.retry.max_age_seconds = Some(1);
+        let schedule = store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .materialize(&schedule, &[at, DateTime::<Utc>::MAX_UTC], None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_runs("tenant-a", Some(schedule.id), None, 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .next_fire_at,
+            Some(at)
+        );
+    }
+}
+
+mod expiry_api_tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use scheduler_service::{
+        api::{self, AppState},
+        store::Store,
+    };
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn invalid_lifetimes_never_create_or_replace_schedules(pool: PgPool) {
+        let store = Store { pool };
+        let app = api::router(AppState::new(
+            store.clone(),
+            super::evaluator(),
+            &BTreeMap::from([("tenant-a".into(), "tenant-a-test-secret".into())]),
+        ));
+        let at = store.now().await.unwrap();
+        let schedule = store
+            .create("tenant-a", super::schedule_spec(at), at, None, "test")
+            .await
+            .unwrap();
+        for age in [0, 31_536_001] {
+            let mut job = serde_json::to_value(super::schedule_spec(at)).unwrap();
+            job["retry"]["max_age_seconds"] = json!(age);
+            for (method, path, body) in [
+                ("POST", "/v1/schedules".to_owned(), job.clone()),
+                (
+                    "PUT",
+                    format!("/v1/schedules/{}", schedule.id),
+                    json!({"expected_revision":1,"spec":job}),
+                ),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header("authorization", "Bearer tenant-a-test-secret")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+        }
+        assert_eq!(
+            store
+                .list_schedules("tenant-a", 100, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let saved = store.get_schedule("tenant-a", schedule.id).await.unwrap();
+        assert_eq!(saved.revision, 1);
+        assert!(saved.spec.retry.max_age_seconds.is_none());
     }
 }

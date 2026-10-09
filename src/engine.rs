@@ -126,6 +126,11 @@ pub async fn recovery_loop(store: Store, shutdown: CancellationToken) {
             Ok(_) => (),
             Err(error) => tracing::error!(%error, "Lease recovery failed"),
         }
+        match store.expire_pending().await {
+            Ok(count) if count > 0 => tracing::info!(count, "Expired pending runs"),
+            Ok(_) => (),
+            Err(error) => tracing::error!(%error, "Run expiration failed"),
+        }
         tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => () }
     }
 }
