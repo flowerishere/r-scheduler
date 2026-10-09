@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Schedule, ScheduleSpec, Trigger},
+    domain::{Attempt, Run, Schedule, ScheduleSpec, Trigger},
     evaluator::Evaluator,
     store::{Store, StoreError},
     trigger::{Evaluation, resolve_delay},
@@ -15,7 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use subtle::ConstantTimeEq;
@@ -108,6 +108,14 @@ pub fn router(state: AppState) -> Router {
         .route("/preview", post(preview))
         .route("/schedules", post(create).get(list_schedules))
         .route("/schedules/{id}", get(get_schedule).put(replace))
+        .route("/schedules/{id}/pause", post(pause))
+        .route("/schedules/{id}/resume", post(resume))
+        .route("/schedules/{id}/cancel", post(cancel))
+        .route("/runs", get(list_runs))
+        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/attempts", get(attempts))
+        .route("/runs/{id}/replay", post(replay))
+        .route("/stats", get(stats))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route(
@@ -301,4 +309,101 @@ async fn get_schedule(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Schedule>> {
     Ok(Json(state.store.get_schedule(&tenant.0, id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    #[serde(default = "page_size")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    schedule_id: Option<Uuid>,
+    status: Option<String>,
+}
+
+impl ListQuery {
+    fn validate(&self) -> Result<()> {
+        if !(1..=100).contains(&self.limit) || !(0..=100_000).contains(&self.offset) {
+            return Err(ApiError::bad(
+                "limit must be 1..100; offset must be 0..100000",
+            ));
+        }
+        if self.status.as_ref().is_some_and(|s| {
+            !matches!(
+                s.as_str(),
+                "pending" | "running" | "succeeded" | "dead" | "cancelled"
+            )
+        }) {
+            return Err(ApiError::bad("Unknown run status"));
+        }
+        Ok(())
+    }
+}
+async fn pause(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Schedule>> {
+    Ok(Json(state.store.transition(&tenant.0, id, "pause").await?))
+}
+async fn resume(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Schedule>> {
+    Ok(Json(state.store.transition(&tenant.0, id, "resume").await?))
+}
+async fn cancel(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Schedule>> {
+    Ok(Json(state.store.transition(&tenant.0, id, "cancel").await?))
+}
+async fn list_runs(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Vec<Run>>> {
+    query.validate()?;
+    Ok(Json(
+        state
+            .store
+            .list_runs(
+                &tenant.0,
+                query.schedule_id,
+                query.status.as_deref(),
+                query.limit,
+                query.offset,
+            )
+            .await?,
+    ))
+}
+async fn get_run(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Run>> {
+    Ok(Json(state.store.get_run(&tenant.0, id).await?))
+}
+async fn replay(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Run>> {
+    Ok(Json(state.store.replay(&tenant.0, id).await?))
+}
+async fn stats(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+) -> Result<Json<Value>> {
+    Ok(Json(state.store.stats(&tenant.0).await?))
+}
+async fn attempts(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<Attempt>>> {
+    Ok(Json(state.store.attempts(&tenant.0, id).await?))
 }

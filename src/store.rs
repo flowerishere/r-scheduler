@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
-use crate::domain::{DeliveryResult, Run, Schedule, ScheduleSpec};
+use crate::domain::{Attempt, DeliveryResult, Run, Schedule, ScheduleSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -292,5 +292,95 @@ impl Store {
         }
         tx.commit().await?;
         Ok(count)
+    }
+    pub async fn transition(&self, tenant: &str, id: Uuid, action: &str) -> Result<Schedule> {
+        let mut tx = self.pool.begin().await?;
+        let old = Self::lock_schedule(&mut tx, tenant, id).await?;
+        if old.status == "cancelled" && action != "cancel" {
+            return Err(StoreError::Conflict(
+                "Cancelled schedules cannot be resumed or paused".into(),
+            ));
+        }
+        let status = match action {
+            "pause" => "paused",
+            "resume" => {
+                if old.next_fire_at.is_some() {
+                    "active"
+                } else {
+                    "completed"
+                }
+            }
+            "cancel" => "cancelled",
+            _ => return Err(StoreError::Conflict("Unknown schedule action".into())),
+        };
+        if action == "cancel" {
+            sqlx::query("UPDATE runs SET status = 'cancelled', finished_at = clock_timestamp(), last_error = 'Schedule cancelled' WHERE schedule_id = $1 AND status = 'pending'")
+                .bind(id).execute(&mut *tx).await?;
+        }
+        let updated = sqlx::query_as("UPDATE schedules SET status = $2, updated_at = clock_timestamp() WHERE id = $1 RETURNING *")
+            .bind(id).bind(status).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+    pub async fn get_run(&self, tenant: &str, id: Uuid) -> Result<Run> {
+        sqlx::query_as("SELECT * FROM runs WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+    pub async fn list_runs(
+        &self,
+        tenant: &str,
+        schedule: Option<Uuid>,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Run>> {
+        Ok(sqlx::query_as("SELECT * FROM runs WHERE tenant_id = $1 AND ($2::uuid IS NULL OR schedule_id = $2) AND ($3::text IS NULL OR status = $3) ORDER BY created_at DESC, id DESC LIMIT $4 OFFSET $5")
+            .bind(tenant).bind(schedule).bind(status).bind(limit).bind(offset).fetch_all(&self.pool).await?)
+    }
+    pub async fn attempts(&self, tenant: &str, id: Uuid) -> Result<Vec<Attempt>> {
+        self.get_run(tenant, id).await?;
+        Ok(
+            sqlx::query_as("SELECT * FROM attempts WHERE run_id=$1 ORDER BY number")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+    pub async fn replay(&self, tenant: &str, id: Uuid) -> Result<Run> {
+        let snapshot = self.get_run(tenant, id).await?;
+        let mut tx = self.pool.begin().await?;
+        let schedule = Self::lock_schedule(&mut tx, tenant, snapshot.schedule_id).await?;
+        if schedule.status == "cancelled" || schedule.revision != snapshot.revision {
+            return Err(StoreError::Conflict(
+                "Cannot replay a cancelled or superseded schedule revision".into(),
+            ));
+        }
+        let run = sqlx::query_as("UPDATE runs SET status = 'pending', cycle_attempts = 0, available_at = clock_timestamp(), finished_at = NULL WHERE id = $1 AND status = 'dead' RETURNING *")
+            .bind(id).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::Conflict("Only dead runs can be replayed".into()))?;
+        tx.commit().await?;
+        Ok(run)
+    }
+    pub async fn stats(&self, tenant: &str) -> Result<serde_json::Value> {
+        let schedule_counts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM schedules WHERE tenant_id = $1 GROUP BY status",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await?;
+        let run_counts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM runs WHERE tenant_id = $1 GROUP BY status",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(serde_json::json!({
+            "schedules": schedule_counts.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+            "runs": run_counts.into_iter().collect::<std::collections::BTreeMap<_, _>>()
+        }))
     }
 }

@@ -1951,3 +1951,349 @@ mod runtime_tests {
         let _ = server.await;
     }
 }
+
+mod lifecycle_tests {
+    use super::evaluator;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::{DateTime, Utc};
+    use http_body_util::BodyExt;
+    use scheduler_service::{
+        api::{self, AppState},
+        domain::{
+            ConcurrencyPolicy, DeliveryResult, HttpTarget, MisfirePolicy, RetryPolicy, Schedule,
+            ScheduleSpec, Trigger,
+        },
+        store::{Store, StoreError},
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("ok".into()),
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    async fn make_ready(store: &Store, run_id: Uuid) {
+        sqlx::query(
+            "UPDATE runs SET available_at = clock_timestamp() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Value,
+        idempotency: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = idempotency {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body)}));
+        (status, value)
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn pause_cancel_and_revision_invalidate_pending_work(pool: PgPool) {
+        let store = Store { pool };
+        let schedule = create_run(&store).await;
+        store
+            .transition("tenant-a", schedule.id, "pause")
+            .await
+            .unwrap();
+        assert!(store.claim().await.unwrap().is_none());
+        store
+            .transition("tenant-a", schedule.id, "resume")
+            .await
+            .unwrap();
+        let old_run = store.claim().await.unwrap().unwrap();
+        let at = store.now().await.unwrap();
+        let updated = store
+            .replace("tenant-a", schedule.id, 1, spec(at), at)
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        assert!(matches!(
+            store
+                .replace("tenant-a", schedule.id, 1, spec(at), at)
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(!store.materialize(&schedule, &[at], None).await.unwrap());
+        store
+            .finish(&old_run, DeliveryResult::error("old revision failed"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_run("tenant-a", old_run.id).await.unwrap().status,
+            "cancelled"
+        );
+        store
+            .materialize(&updated, &[updated.next_fire_at.unwrap()], None)
+            .await
+            .unwrap();
+        store
+            .transition("tenant-a", schedule.id, "cancel")
+            .await
+            .unwrap();
+        assert!(store.claim().await.unwrap().is_none());
+        assert!(
+            store
+                .transition("tenant-a", schedule.id, "resume")
+                .await
+                .is_err()
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn exhausted_retries_replay_preserves_id_and_history(pool: PgPool) {
+        let store = Store { pool };
+        create_run(&store).await;
+        let mut id = Uuid::nil();
+        for number in 1..=3 {
+            let run = store.claim().await.unwrap().unwrap();
+            id = run.id;
+            assert_eq!(run.attempt_count, number);
+            store
+                .finish(&run, DeliveryResult::error("HTTP 503"))
+                .await
+                .unwrap();
+            let updated = store.get_run("tenant-a", run.id).await.unwrap();
+            if number < 3 {
+                assert_eq!(updated.status, "pending");
+                assert!(updated.available_at > store.now().await.unwrap());
+                make_ready(&store, id).await;
+            } else {
+                assert_eq!(updated.status, "dead");
+            }
+        }
+        let replayed = store.replay("tenant-a", id).await.unwrap();
+        assert_eq!(replayed.id, id);
+        assert_eq!(replayed.cycle_attempts, 0);
+        let run = store.claim().await.unwrap().unwrap();
+        assert_eq!(run.attempt_count, 4);
+        store.finish(&run, success()).await.unwrap();
+        assert_eq!(store.attempts("tenant-a", id).await.unwrap().len(), 4);
+        assert!(store.replay("tenant-a", id).await.is_err());
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn lifecycle_http_routes_enforce_tenant_scope_and_preserve_history(pool: PgPool) {
+        let store = Store { pool };
+        let app = api::router(AppState::new(
+            store.clone(),
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ));
+        let schedule = create_run(&store).await;
+        let key = Some("tenant-a-test-secret");
+        let other = Some("tenant-b-test-secret");
+        let path = format!("/v1/schedules/{}", schedule.id);
+        for action in ["pause", "resume", "cancel"] {
+            assert_eq!(
+                request(
+                    &app,
+                    "POST",
+                    &format!("{path}/{action}"),
+                    other,
+                    Value::Null,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &format!("{path}/pause"),
+                key,
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert!(store.claim().await.unwrap().is_none());
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &format!("{path}/resume"),
+                key,
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let run = store.claim().await.unwrap().unwrap();
+        let run_path = format!("/v1/runs/{}", run.id);
+        for suffix in ["", "/attempts"] {
+            assert_eq!(
+                request(
+                    &app,
+                    "GET",
+                    &format!("{run_path}{suffix}"),
+                    other,
+                    Value::Null,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &format!("{run_path}/replay"),
+                other,
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, attempts) = request(
+            &app,
+            "GET",
+            &format!("{run_path}/attempts"),
+            key,
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(attempts.as_array().unwrap().len(), 1);
+        assert_eq!(attempts[0]["number"], 1);
+        assert!(attempts[0].get("lease_token").is_none());
+        assert_eq!(
+            request(&app, "GET", "/v1/runs?limit=0", key, Value::Null, None)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                "/v1/runs?status=unknown",
+                key,
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (_, empty) = request(&app, "GET", "/v1/runs", other, Value::Null, None).await;
+        assert_eq!(empty, json!([]));
+        let (_, stats) = request(&app, "GET", "/v1/stats", other, Value::Null, None).await;
+        assert_eq!(stats, json!({"schedules":{},"runs":{}}));
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &format!("{path}/cancel"),
+                key,
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert!(store.finish(&run, success()).await.unwrap());
+        assert_eq!(
+            store.get_run("tenant-a", run.id).await.unwrap().status,
+            "succeeded"
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &format!("{run_path}/replay"),
+                key,
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+}
