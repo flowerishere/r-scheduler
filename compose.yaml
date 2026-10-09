@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scheduler-local-password}
+      POSTGRES_DB: scheduler
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - scheduler-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "scheduler", "-d", "scheduler"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  service:
+    profiles: ["service"]
+    build: .
+    init: true
+    environment:
+      DATABASE_URL: postgres://scheduler:${POSTGRES_PASSWORD:-scheduler-local-password}@postgres:5432/scheduler
+      SCHEDULER_BIND: 0.0.0.0:8080
+      SCHEDULER_API_KEYS: '${SCHEDULER_API_KEYS:-{"local":"change-this-local-api-key"}}'
+      SCHEDULER_WORKERS: ${SCHEDULER_WORKERS:-8}
+      SCHEDULER_POLL_MS: ${SCHEDULER_POLL_MS:-500}
+      SCHEDULER_RULE_TIMEOUT_MS: ${SCHEDULER_RULE_TIMEOUT_MS:-2000}
+      SCHEDULER_ALLOW_PRIVATE_TARGETS: ${SCHEDULER_ALLOW_PRIVATE_TARGETS:-false}
+      RUST_LOG: ${RUST_LOG:-scheduler_service=info,tower_http=info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 330s
+    restart: unless-stopped
+
+volumes:
+  scheduler-data:

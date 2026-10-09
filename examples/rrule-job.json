@@ -1,0 +1,14 @@
+{
+  "name": "每月最后一个周一至周五日期，排除指定日期",
+  "trigger": {
+    "type": "rrule",
+    "value": "DTSTART;TZID=Asia/Shanghai:20260930T090000\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1\nEXDATE;TZID=Asia/Shanghai:20261030T090000"
+  },
+  "target": {
+    "url": "http://127.0.0.1:9090/hook"
+  },
+  "payload": {
+    "action": "monthly_report"
+  },
+  "misfire": "fire_once"
+}

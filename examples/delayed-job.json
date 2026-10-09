@@ -1,0 +1,20 @@
+{
+  "name": "五秒后处理订单",
+  "trigger": {
+    "type": "delay",
+    "seconds": 5
+  },
+  "target": {
+    "url": "http://127.0.0.1:9090/hook",
+    "timeout_seconds": 10
+  },
+  "payload": {
+    "order_id": "order-42",
+    "action": "check_payment"
+  },
+  "retry": {
+    "max_attempts": 5,
+    "initial_delay_seconds": 1,
+    "max_delay_seconds": 30
+  }
+}

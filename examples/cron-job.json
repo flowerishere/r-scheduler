@@ -1,0 +1,16 @@
+{
+  "name": "每十秒触发",
+  "trigger": {
+    "type": "cron",
+    "expression": "*/10 * * * * *",
+    "timezone": "Asia/Shanghai"
+  },
+  "target": {
+    "url": "http://127.0.0.1:9090/hook"
+  },
+  "payload": {
+    "action": "refresh_cache"
+  },
+  "misfire": "fire_once",
+  "concurrency": "forbid"
+}

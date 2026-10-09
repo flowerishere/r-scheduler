@@ -1,0 +1,8 @@
+{
+  "trigger": {
+    "type": "rrule",
+    "value": "DTSTART;TZID=Asia/Shanghai:20260930T090000\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1\nEXDATE;TZID=Asia/Shanghai:20261030T090000"
+  },
+  "after": "2026-09-21T00:00:00Z",
+  "count": 5
+}
