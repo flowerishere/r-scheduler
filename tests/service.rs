@@ -871,7 +871,7 @@ mod api_tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
-            .arg("serve")
+            .args(["serve", "--role", "api"])
             .env_clear()
             .env(
                 "DATABASE_URL",
@@ -1570,5 +1570,384 @@ mod retry_tests {
             .await
             .unwrap();
         assert!(store.finish(&run, success()).await.unwrap());
+    }
+}
+
+mod runtime_tests {
+    use axum::{
+        Router,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+    use chrono::{DateTime, Utc};
+    use scheduler_service::{
+        domain::{
+            Attempt, ConcurrencyPolicy, DeliveryResult, HttpTarget, MisfirePolicy, RetryPolicy,
+            Run, Schedule, ScheduleSpec, Trigger,
+        },
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use uuid::Uuid;
+    async fn list_runs(store: &Store, schedule: Option<Uuid>) -> Result<Vec<Run>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT * FROM runs WHERE ($1::uuid IS NULL OR schedule_id=$1) ORDER BY created_at,id",
+        )
+        .bind(schedule)
+        .fetch_all(&store.pool)
+        .await
+    }
+    async fn get_run(store: &Store, id: Uuid) -> Result<Run, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM runs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+    }
+    async fn attempts(store: &Store, id: Uuid) -> Result<Vec<Attempt>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM attempts WHERE run_id=$1 ORDER BY number")
+            .bind(id)
+            .fetch_all(&store.pool)
+            .await
+    }
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("ok".into()),
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    async fn make_ready(store: &Store, run_id: Uuid) {
+        sqlx::query(
+            "UPDATE runs SET available_at = clock_timestamp() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn expired_lease_recovers_and_fences_old_worker(pool: PgPool) {
+        let store = Store { pool };
+        create_run(&store).await;
+        let first = store.claim().await.unwrap().unwrap();
+        sqlx::query(
+            "UPDATE runs SET lease_until = clock_timestamp() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(!store.finish(&first, success()).await.unwrap());
+        assert_eq!(store.recover_expired().await.unwrap(), 1);
+        make_ready(&store, first.id).await;
+        let second = store.claim().await.unwrap().unwrap();
+        assert_ne!(first.lease_token, second.lease_token);
+        assert_eq!(second.id, first.id);
+        assert!(!store.finish(&first, success()).await.unwrap());
+        assert!(store.finish(&second, success()).await.unwrap());
+        let attempts = attempts(&store, first.id).await.unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| a.status.as_str())
+                .collect::<Vec<_>>(),
+            ["lease_expired", "succeeded"]
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn killed_service_process_recovers_delivery_after_restart(pool: PgPool) {
+        use sqlx::ConnectOptions;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = received.clone();
+        let first_request = Arc::new(tokio::sync::Notify::new());
+        let notify = first_request.clone();
+        let callback = Router::new().route(
+            "/hook",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                let notify = notify.clone();
+                async move {
+                    let number = {
+                        let mut requests = captured.lock().unwrap();
+                        requests.push(headers["idempotency-key"].to_str().unwrap().to_owned());
+                        requests.len()
+                    };
+                    if number == 1 {
+                        notify.notify_one();
+                        // Hold the first response while the test kills its worker process.
+                        std::future::pending::<()>().await;
+                    }
+                    (StatusCode::OK, "accepted")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let callback_address = listener.local_addr().unwrap();
+        let callback_task = tokio::spawn(async move {
+            axum::serve(listener, callback).await.unwrap();
+        });
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let url = pool.connect_options().to_url_lossy().to_string();
+        let spawn = || {
+            Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+                .args(["serve", "--role", "all"])
+                .env_clear()
+                .env("DATABASE_URL", &url)
+                .env("SCHEDULER_BIND", api_address.to_string())
+                .env(
+                    "SCHEDULER_API_KEYS",
+                    r#"{"tenant-a":"tenant-a-test-secret"}"#,
+                )
+                .env("SCHEDULER_ALLOW_PRIVATE_TARGETS", "true")
+                .env("SCHEDULER_WORKERS", "2")
+                .env("SCHEDULER_POLL_MS", "50")
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(
+                    first.try_wait().unwrap().is_none(),
+                    "Service exited during startup"
+                );
+                if client
+                    .get(format!("http://{api_address}/ready"))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut job = spec(Utc::now());
+        job.trigger = Trigger::Delay { seconds: 0 };
+        job.target.url = format!("http://{callback_address}/hook");
+        let created: Value = client
+            .post(format!("http://{api_address}/v1/schedules"))
+            .bearer_auth("tenant-a-test-secret")
+            .json(&job)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), first_request.notified())
+            .await
+            .unwrap();
+        first.kill().await.unwrap();
+        let store = Store { pool };
+        let schedule_id = created["id"].as_str().unwrap().parse().unwrap();
+        let run = list_runs(&store, Some(schedule_id))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "running");
+        // Advance only the lease deadline instead of making the test wait 16 seconds.
+        sqlx::query(
+            "UPDATE runs SET lease_until = clock_timestamp() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(run.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let mut restarted = spawn();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(
+                    restarted.try_wait().unwrap().is_none(),
+                    "Restarted service exited"
+                );
+                if get_run(&store, run.id).await.unwrap().status == "succeeded" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        restarted.kill().await.unwrap();
+        let attempts = attempts(&store, run.id).await.unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| a.status.as_str())
+                .collect::<Vec<_>>(),
+            ["lease_expired", "succeeded"]
+        );
+        {
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), 2);
+            assert_eq!(received[0], received[1]);
+        }
+        callback_task.abort();
+    }
+    #[cfg(unix)]
+    async fn terminate(child: &mut tokio::process::Child) {
+        let status = tokio::process::Command::new("kill")
+            .args(["-TERM", &child.id().unwrap().to_string()])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn separate_roles_and_sigterm_drain_an_in_flight_delivery(pool: PgPool) {
+        use sqlx::ConnectOptions;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        let (entry, release) = (entered.clone(), released.clone());
+        let callback = Router::new().route(
+            "/hook",
+            post(move || {
+                let (entry, release) = (entry.clone(), release.clone());
+                async move {
+                    entry.notify_one();
+                    release.notified().await;
+                    "accepted"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, callback).await.unwrap();
+        });
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(1);
+        let mut job = spec(at);
+        job.target.url = format!("http://{addr}/hook");
+        job.target.timeout_seconds = 10;
+        let schedule = store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        let url = store.pool.connect_options().to_url_lossy().to_string();
+        let spawn = |role| {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+                .args(["serve", "--role", role])
+                .env_clear()
+                .env("DATABASE_URL", &url)
+                .env("SCHEDULER_POLL_MS", "50")
+                .env("SCHEDULER_WORKERS", "1")
+                .env("SCHEDULER_ALLOW_PRIVATE_TARGETS", "true")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let mut scheduler = spawn("scheduler");
+        let run = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(scheduler.try_wait().unwrap().is_none());
+                let runs = list_runs(&store, Some(schedule.id)).await.unwrap();
+                if let Some(run) = runs.into_iter().next() {
+                    break run;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(run.status, "pending");
+        terminate(&mut scheduler).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), scheduler.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let mut worker = spawn("worker");
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        terminate(&mut worker).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            worker.try_wait().unwrap().is_none(),
+            "shutdown must drain active delivery"
+        );
+        released.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), worker.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(get_run(&store, run.id).await.unwrap().status, "succeeded");
+        server.abort();
+        let _ = server.await;
     }
 }

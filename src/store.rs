@@ -203,7 +203,7 @@ impl Store {
     }
     pub async fn finish(&self, run: &Run, outcome: DeliveryResult) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let changed = Self::record_outcome(&mut tx, run, outcome).await?;
+        let changed = Self::record_outcome(&mut tx, run, outcome, false).await?;
         tx.commit().await?;
         Ok(changed)
     }
@@ -211,6 +211,7 @@ impl Store {
         tx: &mut Transaction<'_, Postgres>,
         snapshot: &Run,
         outcome: DeliveryResult,
+        expired: bool,
     ) -> Result<bool> {
         let schedule = Self::lock_schedule(tx, &snapshot.tenant_id, snapshot.schedule_id).await?;
         let current: Option<Run> = sqlx::query_as("SELECT * FROM runs WHERE id = $1 FOR UPDATE")
@@ -225,7 +226,9 @@ impl Store {
             .await?;
         if current.status != "running"
             || current.lease_token != snapshot.lease_token
-            || current.lease_until.is_none_or(|end| end <= now)
+            || current
+                .lease_until
+                .is_none_or(|end| (end <= now) != expired)
         {
             return Ok(false);
         }
@@ -241,7 +244,9 @@ impl Store {
         } else {
             "pending"
         };
-        let attempt_status = if outcome.success {
+        let attempt_status = if expired {
+            "lease_expired"
+        } else if outcome.success {
             "succeeded"
         } else {
             "failed"
@@ -260,5 +265,32 @@ impl Store {
             .bind(current.id).bind(status).bind(available).bind(last_error).bind(finished)
             .execute(&mut **tx).await?;
         Ok(true)
+    }
+    pub async fn recover_expired(&self) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        // Lock parents while selecting, before LIMIT. A busy schedule with an
+        // entire batch of expired runs must not starve unrelated recovery.
+        let expired: Vec<Run> = sqlx::query_as(
+            "SELECT r.* FROM runs r JOIN schedules s ON s.id = r.schedule_id
+            WHERE r.status = 'running' AND r.lease_until <= clock_timestamp()
+            ORDER BY r.lease_until, r.id LIMIT 100 FOR UPDATE OF s SKIP LOCKED",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut count = 0;
+        for run in expired {
+            if Self::record_outcome(
+                &mut tx,
+                &run,
+                DeliveryResult::error("Worker lease expired; delivery outcome is unknown"),
+                true,
+            )
+            .await?
+            {
+                count += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(count)
     }
 }

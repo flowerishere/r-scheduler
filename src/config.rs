@@ -12,8 +12,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the authenticated HTTP API.
-    Serve,
+    /// Run API, scheduler and/or delivery workers.
+    Serve {
+        #[arg(long, value_enum, default_value = "all")]
+        role: Role,
+    },
     /// Apply embedded database migrations.
     Migrate,
     /// Internal isolated rule evaluator. JSON on stdin/stdout.

@@ -1,10 +1,13 @@
+use crate::webhook;
 use crate::{
     domain::{MisfirePolicy, Schedule, Trigger},
     evaluator::Evaluator,
     store::Store,
 };
 use chrono::{DateTime, Utc};
+use std::time::Duration;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 const CATCH_UP_BATCH: usize = 100;
 
 pub async fn materialize_one(
@@ -94,4 +97,69 @@ pub async fn scheduler_tick(store: &Store, evaluator: &Evaluator) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+pub async fn scheduler_loop(
+    store: Store,
+    evaluator: Evaluator,
+    poll: Duration,
+    shutdown: CancellationToken,
+) {
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        if let Err(error) = scheduler_tick(&store, &evaluator).await {
+            tracing::error!(%error, "Scheduler tick failed");
+        }
+        tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(poll) => () }
+    }
+}
+
+pub async fn recovery_loop(store: Store, shutdown: CancellationToken) {
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match store.recover_expired().await {
+            Ok(count) if count > 0 => tracing::warn!(count, "Recovered expired worker leases"),
+            Ok(_) => (),
+            Err(error) => tracing::error!(%error, "Lease recovery failed"),
+        }
+        tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => () }
+    }
+}
+
+pub async fn worker_loop(
+    store: Store,
+    allow_private: bool,
+    poll: Duration,
+    shutdown: CancellationToken,
+) {
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match store.claim().await {
+            Ok(Some(run)) => {
+                let result = webhook::deliver(&run, allow_private).await;
+                let success = result.success;
+                match store.finish(&run, result).await {
+                    Ok(true) => {
+                        tracing::info!(run_id = %run.id, attempt = run.attempt_count, success, "Delivery attempt completed")
+                    }
+                    Ok(false) => {
+                        tracing::warn!(run_id = %run.id, "Ignored completion after lease loss")
+                    }
+                    Err(error) => {
+                        tracing::error!(run_id = %run.id, %error, "Could not persist result; lease recovery will retry")
+                    }
+                }
+                continue;
+            }
+            Ok(None) => (),
+            Err(error) => tracing::error!(%error, "Worker claim failed"),
+        }
+        tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(poll) => () }
+    }
 }
