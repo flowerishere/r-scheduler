@@ -223,3 +223,140 @@ test("mobile layout, semantic controls and screenshot", async ({page}) => {
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({path: "test-results/console-desktop.png", fullPage: true});
 });
+
+test("an old preview does not populate a newly opened form", async ({page}) => {
+  await login(page);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  let release, intercepted;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { intercepted = resolve; });
+  await page.route("**/v1/preview", async (route) => {
+    const response = await route.fetch(); intercepted(); await waiting; await route.fulfill({response});
+  });
+  await page.getByRole("button", {name: "预览未来 5 次触发"}).click(); await started;
+  await page.getByRole("button", {name: "关闭计划编辑"}).click();
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("触发方式").selectOption("cron");
+  release(); await page.unrouteAll({behavior: "wait"});
+  await expect(page.locator("#preview-result")).toBeEmpty();
+  await expect(page.getByRole("button", {name: "预览未来 5 次触发"})).toBeEnabled();
+  await page.getByRole("button", {name: "预览未来 5 次触发"}).click();
+  await expect(page.locator("#preview-result li")).toHaveCount(5);
+});
+
+test("a late save cannot close or replace a newer draft", async ({page}) => {
+  await login(page);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("late-save-original");
+  await page.getByLabel("目标 URL").fill(callback);
+  let release, intercepted;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { intercepted = resolve; });
+  await page.route("**/v1/schedules", async (route) => {
+    const response = await route.fetch(); intercepted(); await waiting; await route.fulfill({response});
+  });
+  await page.getByRole("button", {name: "创建计划", exact: true}).click(); await started;
+  await page.getByRole("button", {name: "关闭计划编辑"}).click();
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("new-unsaved-draft");
+  release(); await page.unrouteAll({behavior: "wait"});
+  await expect(page.locator("#editor")).toBeVisible();
+  await expect(page.getByLabel("计划名称", {exact: true})).toHaveValue("new-unsaved-draft");
+  await expect(page.getByRole("button", {name: "创建计划", exact: true})).toBeEnabled();
+});
+
+test("a delayed edit load cannot overwrite a new draft", async ({page, request}) => {
+  const schedule = await create(request, "slow-edit-existing-plan");
+  await login(page); await search(page, schedule.id);
+  let release, intercepted;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { intercepted = resolve; });
+  await page.route(`**/v1/schedules/${schedule.id}`, async (route) => {
+    const response = await route.fetch(); intercepted(); await waiting; await route.fulfill({response});
+  });
+  await page.locator("tbody").getByRole("button", {name: "编辑", exact: true}).click(); await started;
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("new-draft-must-survive");
+  const delivered = page.waitForResponse((response) => response.url().endsWith(`/v1/schedules/${schedule.id}`));
+  release(); await delivered; await page.unrouteAll({behavior: "wait"});
+  await expect(page.getByLabel("计划名称", {exact: true})).toHaveValue("new-draft-must-survive");
+  await expect(page.locator("#editor-title")).toHaveText("新建计划");
+});
+
+test("refresh keeps applied filters until the next submit", async ({page, request}) => {
+  await create(request, "filter-applied-one");
+  await create(request, "filter-draft-two");
+  await login(page); await search(page, "filter-applied-one");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await page.getByPlaceholder("搜索计划名称或完整 ID").fill("filter-draft-two");
+  await page.getByRole("button", {name: "刷新", exact: true}).click();
+  await expect(page.locator("#loading")).toBeHidden();
+  await expect(page.locator("tbody")).toContainText("filter-applied-one");
+  await page.getByRole("button", {name: "筛选", exact: true}).click();
+  await expect(page.locator("tbody")).toContainText("filter-draft-two");
+});
+
+test("editing once preserves sub-millisecond precision and invalid dates are rejected", async ({page, request}) => {
+  const at = "2030-06-01T09:00:00.123456Z";
+  const schedule = await create(request, "precise-once-example", {trigger: {type: "once", at}});
+  await login(page); await search(page, schedule.id);
+  await page.locator("tbody").getByRole("button", {name: "编辑", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("precise-once-renamed");
+  await page.getByRole("button", {name: "保存修改"}).click();
+  await expect(page.locator("#editor")).toBeHidden();
+  expect((await getSchedule(request, schedule.id)).spec.trigger.at).toBe(at);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("invalid-february-date");
+  await page.getByLabel("触发方式").selectOption("once");
+  await page.getByLabel("执行时间（带时区）").fill("2030-02-30T09:00:00Z");
+  await page.getByLabel("目标 URL").fill(callback);
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  await expect(page.locator("#editor-error")).toBeVisible();
+  await expect(page.locator("#editor")).toBeVisible();
+});
+
+test("logging out during the initial load leaves no refresh timer", async ({page}) => {
+  await page.addInitScript(() => {
+    const originalSet = window.setInterval, originalClear = window.clearInterval;
+    window.__refreshTimers = new Set();
+    window.setInterval = (...args) => { const id = originalSet(...args); window.__refreshTimers.add(id); return id; };
+    window.clearInterval = (id) => { window.__refreshTimers.delete(id); originalClear(id); };
+  });
+  let release, intercepted;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { intercepted = resolve; });
+  await page.route("**/v1/schedules?**", async (route) => {
+    const response = await route.fetch(); intercepted(); await waiting;
+    await route.fulfill({response}).catch(() => {});
+  });
+  await page.goto("/console/");
+  await page.getByLabel("API key", {exact: true}).fill(key);
+  await page.getByRole("button", {name: "连接工作空间"}).click(); await started;
+  await page.getByRole("button", {name: "退出工作空间"}).click();
+  release(); await page.unrouteAll({behavior: "wait"});
+  await expect(page.getByRole("button", {name: "连接工作空间"})).toBeEnabled();
+  expect(await page.evaluate(() => window.__refreshTimers.size)).toBe(0);
+  await page.getByLabel("API key", {exact: true}).fill(key);
+  await page.getByRole("button", {name: "连接工作空间"}).click();
+  await expect(page.locator("#workspace")).toBeVisible();
+  await expect(page.locator("#refresh")).toBeEnabled();
+  expect(await page.evaluate(() => window.__refreshTimers.size)).toBe(1);
+  await page.getByRole("button", {name: "退出工作空间"}).click();
+  expect(await page.evaluate(() => window.__refreshTimers.size)).toBe(0);
+});
+
+test("invalid fields in collapsed advanced options are revealed", async ({page}) => {
+  await login(page);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("invalid-hidden-options");
+  await page.getByLabel("目标 URL").fill(callback);
+  await page.locator("#advanced summary").click();
+  await page.getByLabel("最大尝试次数", {exact: true}).fill("0");
+  await page.locator("#advanced summary").click();
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  await expect(page.getByLabel("最大尝试次数", {exact: true})).toBeVisible();
+  await expect(page.getByLabel("最大尝试次数", {exact: true})).toBeFocused();
+  await page.getByLabel("最大尝试次数", {exact: true}).fill("3");
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  await expect(page.locator("#editor")).toBeHidden();
+});

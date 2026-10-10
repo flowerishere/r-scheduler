@@ -54,7 +54,7 @@ async function api(path, {method = "GET", body, idempotency} = {}) {
 }
 
 function logout(message = "") {
-  state.editorBusy = false; state.key = ""; state.session++; state.request++; state.detail++;
+  state.key = ""; state.session++; state.request++; state.detail++;
   clearInterval(state.timer); state.timer = null; clearTimeout(state.toast);
   for (const controller of state.controllers) controller.abort();
   state.controllers.clear();
@@ -219,7 +219,6 @@ function triggerFields() {
 $("trigger-type").addEventListener("change", triggerFields);
 for (const id of ["delay-seconds", "once-at", "cron-expression", "cron-timezone", "rrule-value"]) $(id).addEventListener("input", invalidatePreview);
 function openEditor(schedule = null) {
-  if (state.editorBusy) return;
   state.editor++; $("save-schedule").disabled = false;
   $("schedule-form").reset(); $("advanced").open = false; state.editing = schedule; state.creation = null;
   hideError("editor-error"); $("preview-result").replaceChildren();
@@ -246,17 +245,14 @@ function openEditor(schedule = null) {
 }
 for (const id of ["create-schedule", "empty-create"]) $(id).addEventListener("click", () => openEditor());
 async function editSchedule(id) {
-  if (state.editorBusy) return;
-  state.editorBusy = true;
   const editor = ++state.editor, detail = state.detail, fromDetail = $("detail").open;
   const current = () => editor === state.editor && (!fromDetail || (detail === state.detail && $("detail").open));
   try {
     const schedule = await api(`/schedules/${id}`);
     if (!current()) return;
     if (schedule.status === "cancelled") throw new Error("计划已被取消，不能继续编辑。");
-    state.editorBusy = false; $("detail").close(); openEditor(schedule);
+    $("detail").close(); openEditor(schedule);
   } catch (error) { if (current() && !silent(error) && state.key) reportActionError(error); }
-  finally { state.editorBusy = false; }
 }
 $("reload-editor").addEventListener("click", async () => {
   if (!state.editing) return;
@@ -295,8 +291,6 @@ function readSpec() {
 $("preview-trigger").addEventListener("click", async () => {
   const editor = state.editor, previewId = ++state.preview;
   const current = () => editor === state.editor && previewId === state.preview && $("editor").open;
-  if (state.editorBusy) return;
-  state.editorBusy = true;
   const button = $("preview-trigger"); button.disabled = true; $("preview-result").replaceChildren();
   try {
     const preview = await api("/preview", {method: "POST", body: {trigger: readTrigger(), count: 5}});
@@ -306,14 +300,15 @@ $("preview-trigger").addEventListener("click", async () => {
     if (!preview.dates.length) $("preview-result").append(node("p", "当前时间之后没有触发点。0 秒延迟创建后仍会立即进入调度。", "field-help"));
     else if (preview.exhausted) $("preview-result").append(node("p", "以上为全部剩余触发时间。", "field-help"));
   } catch (error) { if (current() && !silent(error)) $("preview-result").append(node("p", error.message, "error")); }
-  finally { state.editorBusy = false; if (current()) button.disabled = false; }
+  finally { if (current()) button.disabled = false; }
 });
+$("schedule-form").addEventListener("invalid", (event) => {
+  const details = event.target.closest("details");
+  if (details) details.open = true;
+}, true);
 $("schedule-form").addEventListener("submit", async (event) => {
   const editor = state.editor, editing = state.editing, session = state.session;
-  event.preventDefault();
-  if (state.editorBusy) return;
-  state.editorBusy = true;
-  hideError("editor-error"); $("save-schedule").disabled = true;
+  event.preventDefault(); hideError("editor-error"); $("save-schedule").disabled = true;
   try {
     const spec = readSpec();
     if (editing) await api(`/schedules/${editing.id}`, {method: "PUT", body: {expected_revision: editing.revision, spec}});
@@ -331,12 +326,11 @@ $("schedule-form").addEventListener("submit", async (event) => {
     else await refresh(true);
   } catch (error) {
     if (!silent(error) && state.key && editor === state.editor) { showError("editor-error", error); $("editor-error").scrollIntoView({block: "nearest"}); }
-  } finally { state.editorBusy = false; if (editor === state.editor) $("save-schedule").disabled = false; }
+  } finally { if (editor === state.editor) $("save-schedule").disabled = false; }
 });
 $("editor").addEventListener("close", () => { state.editor++; invalidatePreview(); });
 
-for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => { if (button.dataset.close !== "editor" || !state.editorBusy) $(button.dataset.close).close(); });
-$("editor").addEventListener("cancel", (event) => { if (state.editorBusy) event.preventDefault(); });
+for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => $(button.dataset.close).close());
 function confirm(title, description, label) {
   return new Promise((resolve) => {
     $("confirm-title").textContent = title; $("confirm-description").textContent = description; $("confirm-yes").textContent = label;
