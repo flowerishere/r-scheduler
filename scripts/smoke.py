@@ -104,6 +104,10 @@ def main():
         eventually(ready)
         assert api("/health")["status"] == "ok"
         assert api("/")["version"] == "0.5.0"
+        with opener.open(base + "/console/", timeout=5) as response:
+            assert "text/html" in response.headers["Content-Type"]
+            assert "调度控制台" in response.read().decode()
+        assert api("/v1/me")["tenant_id"] == "smoke"
         preview = api("/v1/preview", {
             "trigger": {"type": "rrule", "value": "DTSTART;TZID=Asia/Shanghai:20260930T090000\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1\nEXDATE;TZID=Asia/Shanghai:20261030T090000"},
             "after": "2026-09-21T00:00:00Z", "count": 3,
@@ -146,7 +150,7 @@ def main():
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, tenant metrics, stable idempotency key, graceful shutdown")
+        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, tenant metrics, embedded console, stable idempotency key, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)

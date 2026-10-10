@@ -42,7 +42,7 @@
     <div class="workspace-body">
       <header class="topbar"><span>工作空间 <span class="slash">/</span> <strong id="breadcrumb">调度计划</strong></span><div class="topbar-right"><span id="connection-state" class="connection"><i></i> 已连接</span><span class="timezone-label">时间显示：浏览器时区</span></div></header>
       <main id="main-content" tabindex="-1">
-        <div class="page-heading"><div><p class="eyebrow">SCHEDULER OVERVIEW</p><h1 id="page-title">调度计划</h1><p id="page-description" class="muted">安排下一次执行，掌握每一个周期。</p></div></div>
+        <div class="page-heading"><div><p class="eyebrow">SCHEDULER OVERVIEW</p><h1 id="page-title">调度计划</h1><p id="page-description" class="muted">安排下一次执行，掌握每一个周期。</p></div><button id="create-schedule" class="primary"><span aria-hidden="true">＋</span> 新建计划</button></div>
         <section class="stats-grid" aria-label="当前租户统计">
           <article class="stat-card"><span>运行中的计划</span><strong id="stat-active">—</strong><small>等待下一个触发时间</small></article>
           <article class="stat-card"><span>等待执行</span><strong id="stat-pending">—</strong><small>已生成的待投递实例</small></article>
@@ -59,7 +59,7 @@
           </form>
           <p id="list-error" class="error panel-message" role="alert" hidden></p>
           <div id="loading" class="empty-state" role="status" hidden>正在读取工作空间…</div>
-          <div id="empty-state" class="empty-state" hidden><div class="empty-icon" aria-hidden="true">◷</div><h3 id="empty-title">还没有调度计划</h3><p id="empty-description">通过 API 创建计划后，可在这里查看执行情况。</p></div>
+          <div id="empty-state" class="empty-state" hidden><div class="empty-icon" aria-hidden="true">◷</div><h3 id="empty-title">还没有调度计划</h3><p id="empty-description">创建第一个计划，安排一次延迟任务或周期执行。</p><button id="empty-create" class="secondary">创建计划</button></div>
           <div id="table-wrap" class="table-wrap" hidden><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
           <footer class="pagination"><span id="page-summary">每页 20 条</span><div><button id="previous-page" class="secondary compact" disabled>上一页</button><button id="next-page" class="secondary compact" disabled>下一页</button></div></footer>
         </section>
@@ -68,6 +68,32 @@
     </div>
   </div>
 
+  <dialog id="editor" class="editor-dialog" aria-labelledby="editor-title">
+    <div class="dialog-heading"><div><p class="eyebrow">SCHEDULE</p><h2 id="editor-title">新建计划</h2></div><button class="icon-button" data-close="editor" aria-label="关闭计划编辑">×</button></div>
+    <form id="schedule-form">
+      <div class="dialog-content">
+        <p id="edit-notice" class="notice" hidden>保存会替换当前规则并取消旧版本尚未执行的实例。已经开始的投递可以完成。</p>
+        <label for="job-name">计划名称</label><input id="job-name" name="name" required maxlength="200" placeholder="例如：每日订单汇总">
+        <div class="form-grid"><label>触发方式<select id="trigger-type"><option value="delay">延迟执行</option><option value="once">指定时间</option><option value="cron">Cron 周期</option><option value="rrule">RRULE 周期</option></select></label><label data-trigger="delay">延迟秒数<input id="delay-seconds" type="number" min="0" max="31536000" value="30" required></label><label data-trigger="once" hidden>执行时间（带时区）<input id="once-at" placeholder="2026-10-01T09:00:00+08:00"></label></div>
+        <div data-trigger="cron" hidden><div class="form-grid"><label>Cron 表达式<input id="cron-expression" value="0 9 * * MON-FRI" spellcheck="false"></label><label>IANA 时区<input id="cron-timezone" value="Asia/Shanghai" spellcheck="false"></label></div><p class="field-help">支持 5 个字段，或在最前面增加秒字段。例如每天 09:00：0 9 * * *</p></div>
+        <div data-trigger="rrule" hidden><label for="rrule-value">RRULE 规则集</label><textarea id="rrule-value" class="code-input" rows="4" spellcheck="false"></textarea><p class="field-help">包含 DTSTART，并使用 UTC Z 或显式 TZID 指定起始时间。</p></div>
+        <div class="preview-section"><button id="preview-trigger" class="secondary compact" type="button">预览未来 5 次触发</button><span class="field-help">周期以当前时间为起点</span><div id="preview-result" aria-live="polite"></div></div>
+        <div class="section-label">HTTP 投递</div>
+        <label for="target-url">目标 URL</label><input id="target-url" type="url" required placeholder="https://your-service.example/hooks/task">
+        <label for="payload">Payload（JSON）</label><textarea id="payload" class="code-input" rows="4" spellcheck="false">{}</textarea>
+        <details id="advanced"><summary>重试、并发与更多选项</summary>
+          <div class="form-grid"><label>请求超时（秒）<input id="timeout-seconds" type="number" min="1" max="300" value="30" required></label><label>最大尝试次数<input id="max-attempts" type="number" min="1" max="100" value="5" required></label><label>初始退避（秒）<input id="initial-delay" type="number" min="1" max="86400" value="5" required></label><label>最大退避（秒）<input id="max-delay" type="number" min="1" max="86400" value="3600" required></label><label>有效期（秒，可选）<input id="max-age" type="number" min="1" max="31536000" placeholder="不限制"></label><label>漏调度宽限（秒）<input id="misfire-grace" type="number" min="0" max="86400" value="60" required></label><label>漏调度策略<select id="misfire"><option value="fire_once">合并为一次</option><option value="skip">超过宽限后跳过</option><option value="catch_up">逐次补偿</option></select></label><label>同一计划的并发<select id="concurrency"><option value="allow">允许并行</option><option value="forbid">串行排队</option></select></label></div>
+          <p class="field-help">有效期从原计划时间计算；到期后不再认领，已开始的请求允许完成。</p>
+          <label for="target-headers">自定义请求头（JSON 对象）</label><textarea id="target-headers" class="code-input" rows="3" spellcheck="false">{}</textarea>
+        </details>
+        <p id="editor-error" class="error" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button id="reload-editor" class="text-button" type="button" hidden>重新载入最新版本</button><div class="footer-actions"><button class="secondary" type="button" data-close="editor">取消</button><button id="save-schedule" class="primary" type="submit">创建计划</button></div></footer>
+    </form>
+  </dialog>
+
+  <dialog id="detail" class="detail-dialog" aria-labelledby="detail-title"><div class="dialog-heading"><div><p class="eyebrow" id="detail-eyebrow">DETAIL</p><h2 id="detail-title">详情</h2></div><button class="icon-button" data-close="detail" aria-label="关闭详情">×</button></div><div class="dialog-content" id="detail-content"></div><footer class="dialog-footer" id="detail-actions"></footer></dialog>
+  <dialog id="confirm" class="confirm-dialog" aria-labelledby="confirm-title"><div class="dialog-content"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p></div><footer class="dialog-footer"><button class="secondary" id="confirm-no">返回</button><button class="danger" id="confirm-yes">确认</button></footer></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <noscript>控制台需要启用 JavaScript。也可以使用 HTTP API 管理计划。</noscript>
 </body>
