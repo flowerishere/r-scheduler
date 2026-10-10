@@ -3009,3 +3009,190 @@ mod cleanup_tests {
         );
     }
 }
+
+mod metrics_tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::{DateTime, Utc};
+    use http_body_util::BodyExt;
+    use scheduler_service::{
+        api::{self, AppState},
+        domain::{
+            ConcurrencyPolicy, DeliveryResult, HttpTarget, MisfirePolicy, RetryPolicy, Schedule,
+            ScheduleSpec, Trigger,
+        },
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    use super::evaluator;
+    fn app(store: Store) -> Router {
+        api::router(AppState::new(
+            store,
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ))
+    }
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("ok".into()),
+            retry_after: None,
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Value,
+        idempotency: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = idempotency {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body)}));
+        (status, value)
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn metrics_require_auth_and_only_expose_the_current_tenant(pool: PgPool) {
+        let store = Store { pool };
+        let schedule = create_run(&store).await;
+        let app = app(store.clone());
+        assert_eq!(
+            request(&app, "GET", "/v1/metrics", None, Value::Null, None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics")
+                    .header("authorization", "Bearer tenant-a-test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let metrics = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics.contains("scheduler_runs{status=\"pending\"} 1\n"));
+        assert!(metrics.contains("scheduler_ready_runs 1\n"));
+        assert!(!metrics.contains(&schedule.id.to_string()));
+        let (_, other) = request(
+            &app,
+            "GET",
+            "/v1/metrics",
+            Some("tenant-b-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert!(
+            other["raw"]
+                .as_str()
+                .unwrap()
+                .contains("scheduler_runs{status=\"pending\"} 0\n")
+        );
+        store
+            .transition("tenant-a", schedule.id, "pause")
+            .await
+            .unwrap();
+        let paused = store.metrics("tenant-a").await.unwrap();
+        assert!(paused.contains("scheduler_ready_runs 0\n"));
+        assert!(paused.contains("scheduler_oldest_ready_age_seconds 0\n"));
+        store
+            .transition("tenant-a", schedule.id, "resume")
+            .await
+            .unwrap();
+        let run = store.claim().await.unwrap().unwrap();
+        store.finish(&run, success()).await.unwrap();
+        assert!(
+            store
+                .metrics("tenant-a")
+                .await
+                .unwrap()
+                .contains("scheduler_runs{status=\"succeeded\"} 1\n")
+        );
+    }
+}

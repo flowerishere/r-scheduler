@@ -116,6 +116,7 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{id}/attempts", get(attempts))
         .route("/runs/{id}/replay", post(replay))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route(
@@ -406,4 +407,18 @@ async fn attempts(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Attempt>>> {
     Ok(Json(state.store.attempts(&tenant.0, id).await?))
+}
+
+async fn metrics(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+) -> Result<Response> {
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.store.metrics(&tenant.0).await?,
+    )
+        .into_response())
 }

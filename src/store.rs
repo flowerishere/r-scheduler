@@ -478,6 +478,76 @@ impl Store {
         tx.commit().await?;
         Ok(report)
     }
+    pub async fn metrics(&self, tenant: &str) -> Result<String> {
+        use std::fmt::Write;
+        // Every gauge uses the same database snapshot.
+        let MetricsSnapshot { schedules, runs, ready, oldest, expired, due } = sqlx::query_as(
+            "WITH ready AS (
+                SELECT r.available_at FROM runs r JOIN schedules s ON s.id = r.schedule_id
+                WHERE r.tenant_id = $1 AND r.status = 'pending' AND r.available_at <= statement_timestamp()
+                AND (r.expires_at IS NULL OR r.expires_at > statement_timestamp()) AND s.status NOT IN ('paused', 'cancelled')
+            ) SELECT
+                (SELECT COALESCE(jsonb_object_agg(status, n), '{}'::jsonb) FROM (SELECT status, COUNT(*) n FROM schedules WHERE tenant_id = $1 GROUP BY status) c) AS schedules,
+                (SELECT COALESCE(jsonb_object_agg(status, n), '{}'::jsonb) FROM (SELECT status, COUNT(*) n FROM runs WHERE tenant_id = $1 GROUP BY status) c) AS runs,
+                (SELECT COUNT(*) FROM ready) AS ready,
+                (SELECT COALESCE(EXTRACT(EPOCH FROM statement_timestamp() - MIN(available_at)), 0)::double precision FROM ready) AS oldest,
+                (SELECT COUNT(*) FROM runs WHERE tenant_id = $1 AND status = 'running' AND lease_until <= statement_timestamp()) AS expired,
+                (SELECT GREATEST(COALESCE(EXTRACT(EPOCH FROM statement_timestamp() - MIN(next_fire_at)), 0), 0)::double precision FROM schedules WHERE tenant_id = $1 AND status = 'active') AS due")
+            .bind(tenant).fetch_one(&self.pool).await?;
+        let mut output = String::new();
+        for (name, help, counts, statuses) in [
+            (
+                "scheduler_schedules",
+                "Retained schedules by current status.",
+                schedules,
+                &["active", "paused", "completed", "cancelled", "error"][..],
+            ),
+            (
+                "scheduler_runs",
+                "Retained runs by current status.",
+                runs,
+                &["pending", "running", "succeeded", "dead", "cancelled"][..],
+            ),
+        ] {
+            writeln!(output, "# HELP {name} {help}\n# TYPE {name} gauge").unwrap();
+            for status in statuses {
+                let count = counts
+                    .get(*status)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                writeln!(output, "{name}{{status=\"{status}\"}} {count}").unwrap();
+            }
+        }
+        for (name, help, value) in [
+            (
+                "scheduler_ready_runs",
+                "Due unexpired pending runs on unpaused schedules, including concurrency-blocked work.",
+                ready as f64,
+            ),
+            (
+                "scheduler_oldest_ready_age_seconds",
+                "Age of the oldest ready run, or zero.",
+                oldest,
+            ),
+            (
+                "scheduler_expired_leases",
+                "Running deliveries whose worker lease has expired.",
+                expired as f64,
+            ),
+            (
+                "scheduler_oldest_due_schedule_age_seconds",
+                "Age of the oldest unmaterialized active schedule cursor, or zero.",
+                due,
+            ),
+        ] {
+            writeln!(
+                output,
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
+            )
+            .unwrap();
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -487,4 +557,14 @@ pub struct CleanupReport {
     pub eligible_runs: i64,
     pub deleted_runs: u64,
     pub deleted_attempts: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct MetricsSnapshot {
+    schedules: serde_json::Value,
+    runs: serde_json::Value,
+    ready: i64,
+    oldest: f64,
+    expired: i64,
+    due: f64,
 }

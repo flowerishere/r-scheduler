@@ -126,6 +126,14 @@ def main():
             assert len(requests) == 2
             assert requests[0][1] == requests[1][1] == run["id"]
             assert requests[1][0] - requests[0][0] >= 2
+        assert 'scheduler_runs{status="succeeded"} 1\n' in api("/v1/metrics")
+        assert 'scheduler_runs{status="succeeded"} 0\n' in api("/v1/metrics", key="smoke-tenant-b-api-key")
+        try:
+            api("/v1/metrics", key=None)
+            raise AssertionError("Metrics accepted an unauthenticated request")
+        except urllib.error.HTTPError as error:
+            assert error.code == 401
+
         job["trigger"] = {"type": "once", "at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).isoformat()}
         job["retry"]["max_age_seconds"] = 1
         expired = api("/v1/schedules", job)
@@ -138,7 +146,7 @@ def main():
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, stable idempotency key, graceful shutdown")
+        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, tenant metrics, stable idempotency key, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)
