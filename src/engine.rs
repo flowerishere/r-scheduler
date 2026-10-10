@@ -80,10 +80,11 @@ pub async fn scheduler_tick(store: &Store, evaluator: &Evaluator) -> anyhow::Res
                     Ok(true) => tracing::debug!(schedule_id = %schedule.id, "Materialized schedule"),
                     Ok(false) => (),
                     Err(error) => {
-                        // Database failures and evaluator overload remain retryable.
+                        // Database and evaluator infrastructure failures remain retryable.
                         // Rule failures retain the cursor for repair.
                         if error.downcast_ref::<crate::store::StoreError>().is_none()
-                            && error.downcast_ref::<crate::evaluator::EvaluatorBusy>().is_none() {
+                            && error.downcast_ref::<crate::evaluator::EvaluatorBusy>().is_none()
+                            && error.downcast_ref::<crate::evaluator::EvaluatorUnavailable>().is_none() {
                             store.rule_error(&schedule, &format!("{error:#}")).await?;
                         }
                         tracing::warn!(schedule_id = %schedule.id, error = %format!("{error:#}"), "Schedule expansion failed");

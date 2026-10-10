@@ -225,6 +225,7 @@ async fn initial_schema_enforces_tenants_occurrences_and_leases(pool: sqlx::PgPo
 }
 
 fn schedule_spec(at: chrono::DateTime<chrono::Utc>) -> scheduler_service::domain::ScheduleSpec {
+    let at = at - chrono::Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos() % 1000));
     serde_json::from_value(serde_json::json!({
         "name": "test job",
         "trigger": {"type": "once", "at": at},
@@ -3412,6 +3413,392 @@ mod console_tests {
                 .0,
                 StatusCode::BAD_REQUEST,
                 "{uri}"
+            );
+        }
+    }
+}
+
+mod recurrence_tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::{DateTime, Utc};
+    use http_body_util::BodyExt;
+    use scheduler_service::{
+        api::{self, AppState},
+        domain::{
+            ConcurrencyPolicy, HttpTarget, MisfirePolicy, RetryPolicy, Schedule, ScheduleSpec,
+            Trigger,
+        },
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    use super::evaluator;
+    use scheduler_service::{
+        engine::{materialize_one, scheduler_tick},
+        evaluator::Evaluator,
+    };
+    use std::time::Duration;
+    fn app(store: Store) -> Router {
+        api::router(AppState::new(
+            store,
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ))
+    }
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Value,
+        idempotency: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = idempotency {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body)}));
+        (status, value)
+    }
+    fn app_with_evaluator(store: Store, evaluator: Evaluator) -> Router {
+        let keys = BTreeMap::from([
+            ("tenant-a".into(), "tenant-a-test-secret".into()),
+            ("tenant-b".into(), "tenant-b-test-secret".into()),
+        ]);
+        api::router(AppState::new(store, evaluator, &keys))
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn catch_up_deduplicates_overlapping_rules_and_keeps_its_cursor(pool: PgPool) {
+        let store = Store { pool };
+        let first: DateTime<Utc> = "2026-09-21T12:00:00Z".parse().unwrap();
+        let now = first + chrono::Duration::seconds(150);
+        let mut job = spec(first);
+        job.trigger = Trigger::Rrule { value: "DTSTART:20260921T120000Z\nRRULE:FREQ=SECONDLY;COUNT=151\nRRULE:FREQ=SECONDLY;INTERVAL=2;COUNT=76\nRDATE:20260921T120000Z,20260921T120000Z,20260921T120230Z\nEXDATE:20260921T120100Z".into() };
+        job.misfire = MisfirePolicy::CatchUp;
+        let schedule = store
+            .create("tenant-a", job, first, None, "test")
+            .await
+            .unwrap();
+        materialize_one(&store, &evaluator(), &schedule, now)
+            .await
+            .unwrap();
+        let current = store.get_schedule("tenant-a", schedule.id).await.unwrap();
+        assert_eq!(
+            current.next_fire_at,
+            Some(first + chrono::Duration::seconds(101))
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE schedule_id = $1")
+            .bind(schedule.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 100);
+        materialize_one(&store, &evaluator(), &current, now)
+            .await
+            .unwrap();
+        let dates: Vec<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT scheduled_at FROM runs WHERE schedule_id = $1 ORDER BY scheduled_at",
+        )
+        .bind(schedule.id)
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let expected: Vec<_> = (0..=150)
+            .filter(|second| *second != 60)
+            .map(|second| first + chrono::Duration::seconds(second))
+            .collect();
+        assert_eq!(dates, expected);
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn unsupported_calendar_properties_are_rejected_before_creation(pool: PgPool) {
+        let store = Store { pool };
+        let app = app(store.clone());
+        for property in [
+            "EXRULE:FREQ=DAILY;COUNT=2",
+            "RDATE;VALUE=DATE:20300102",
+            "EXDATE:20300102",
+        ] {
+            let trigger = json!({"type": "rrule", "value": format!("DTSTART:20300101T090000Z\nRRULE:FREQ=DAILY;COUNT=3\n{property}")});
+            let (status, error) = request(
+                &app,
+                "POST",
+                "/v1/preview",
+                Some("tenant-a-test-secret"),
+                json!({"trigger": trigger, "after": "2026-09-21T00:00:00Z"}),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            let mut job = serde_json::to_value(spec(Utc::now())).unwrap();
+            job["trigger"] = trigger;
+            let (status, error) = request(
+                &app,
+                "POST",
+                "/v1/schedules",
+                Some("tenant-a-test-secret"),
+                job,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        }
+        assert!(
+            store
+                .list_schedules("tenant-a", 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn once_rejects_unrepresentable_timestamps_before_writing(pool: PgPool) {
+        let store = Store { pool };
+        let app = app(store.clone());
+        let schedule = create_due(&store).await;
+        for timestamp in ["2030-06-01T09:00:00.123456789Z", "2016-12-31T23:59:60Z"] {
+            let at: DateTime<Utc> = timestamp.parse().unwrap();
+            let job = spec(at);
+            for (method, path, body) in [
+                (
+                    "POST",
+                    "/v1/preview".to_owned(),
+                    json!({"trigger": job.trigger, "after": "2010-01-01T00:00:00Z"}),
+                ),
+                ("POST", "/v1/schedules".to_owned(), json!(job)),
+                (
+                    "PUT",
+                    format!("/v1/schedules/{}", schedule.id),
+                    json!({"expected_revision": 1, "spec": job}),
+                ),
+            ] {
+                let (status, body) = request(
+                    &app,
+                    method,
+                    &path,
+                    Some("tenant-a-test-secret"),
+                    body,
+                    None,
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{timestamp}: {body}");
+            }
+        }
+        assert_eq!(
+            store
+                .list_schedules("tenant-a", 100, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+        let at: DateTime<Utc> = "2030-06-01T09:00:00.123456Z".parse().unwrap();
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/v1/schedules",
+            Some("tenant-a-test-secret"),
+            json!(spec(at)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["spec"]["trigger"]["at"], body["next_fire_at"]);
+        assert_eq!(body["next_fire_at"], "2030-06-01T09:00:00.123456Z");
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn evaluator_infrastructure_failures_remain_retryable(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        let mut spec = spec(at);
+        spec.trigger = Trigger::Cron {
+            expression: "* * * * * *".into(),
+            timezone: "UTC".into(),
+        };
+        let schedule = store
+            .create("tenant-a", spec.clone(), at, None, "test")
+            .await
+            .unwrap();
+        for executable in [
+            "/missing-scheduler-test-executable",
+            "/bin/false",
+            "/bin/echo",
+        ] {
+            let unavailable = Evaluator::new(executable.into(), Duration::from_secs(2));
+            scheduler_tick(&store, &unavailable).await.unwrap();
+            let current = store.get_schedule("tenant-a", schedule.id).await.unwrap();
+            assert_eq!(current.status, "active", "{executable}");
+            assert_eq!(current.next_fire_at, schedule.next_fire_at);
+            assert!(current.last_error.is_none());
+            let app = app_with_evaluator(store.clone(), unavailable);
+            for (method, path, body) in [
+                (
+                    "POST",
+                    "/v1/preview".to_owned(),
+                    json!({"trigger": spec.trigger, "after": at, "count": 1}),
+                ),
+                ("POST", "/v1/schedules".to_owned(), json!(spec)),
+                (
+                    "PUT",
+                    format!("/v1/schedules/{}", schedule.id),
+                    json!({"expected_revision": 1, "spec": spec}),
+                ),
+            ] {
+                let (status, body) = request(
+                    &app,
+                    method,
+                    &path,
+                    Some("tenant-a-test-secret"),
+                    body,
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{executable}: {body}"
+                );
+                assert!(!body.to_string().contains(executable));
+            }
+        }
+        scheduler_tick(&store, &evaluator()).await.unwrap();
+        assert_eq!(
+            store
+                .list_runs("tenant-a", Some(schedule.id), None, 100, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .next_fire_at
+                > Some(at)
+        );
+
+        spec.trigger = Trigger::Cron {
+            expression: "invalid rule".into(),
+            timezone: "UTC".into(),
+        };
+        let invalid = store
+            .create("tenant-a", spec, at, None, "test")
+            .await
+            .unwrap();
+        scheduler_tick(&store, &evaluator()).await.unwrap();
+        assert_eq!(
+            store
+                .get_schedule("tenant-a", invalid.id)
+                .await
+                .unwrap()
+                .status,
+            "error"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn skip_misfire_compares_fractional_seconds_without_truncation(pool: PgPool) {
+        let store = Store { pool };
+        let first: DateTime<Utc> = "2026-09-21T12:00:00Z".parse().unwrap();
+        for (lateness_ms, expected) in [(60_000, 1), (60_001, 0)] {
+            let mut job = spec(first);
+            job.trigger = Trigger::Cron {
+                expression: "* * * * *".into(),
+                timezone: "UTC".into(),
+            };
+            job.misfire = MisfirePolicy::Skip;
+            let schedule = store
+                .create("tenant-a", job, first, None, "test")
+                .await
+                .unwrap();
+            materialize_one(
+                &store,
+                &evaluator(),
+                &schedule,
+                first + chrono::Duration::milliseconds(lateness_ms),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .list_runs("tenant-a", Some(schedule.id), None, 100, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                expected
             );
         }
     }

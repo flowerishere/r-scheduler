@@ -11,9 +11,12 @@ use reqwest::{
 };
 use url::{Host, Url};
 
-use crate::domain::{DeliveryResult, HttpTarget, RetryAfter, Run, ScheduleSpec};
+use crate::domain::{DeliveryResult, HttpTarget, RetryAfter, Run, ScheduleSpec, Trigger};
 
 pub fn validate_spec(spec: &ScheduleSpec) -> anyhow::Result<()> {
+    if let Trigger::Once { at } = spec.trigger {
+        crate::trigger::validate_once(at)?;
+    }
     if contains_nul(&serde_json::to_value(spec)?) {
         bail!("JSON strings and field names must not contain U+0000");
     }

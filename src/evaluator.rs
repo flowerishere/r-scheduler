@@ -13,6 +13,10 @@ use crate::{
 #[error("Rule evaluator is busy; retry later")]
 pub struct EvaluatorBusy;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Rule evaluator is unavailable; retry later")]
+pub struct EvaluatorUnavailable(#[source] anyhow::Error);
+
 #[derive(Clone)]
 pub struct Evaluator {
     executable: PathBuf,
@@ -72,9 +76,8 @@ impl Evaluator {
         };
         let result = tokio::time::timeout(self.timeout, operation)
             .await
-            .context(
-                "Rule evaluation timed out; shorten the rule history or simplify the rule",
-            )??;
+            .context("Rule evaluation timed out; shorten the rule history or simplify the rule")?
+            .map_err(EvaluatorUnavailable)?;
         result.map_err(anyhow::Error::msg)
     }
 }

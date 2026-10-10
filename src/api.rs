@@ -55,6 +55,13 @@ pub struct ApiError(StatusCode, String);
 impl ApiError {
     fn evaluation(error: anyhow::Error) -> Self {
         if error
+            .downcast_ref::<crate::evaluator::EvaluatorUnavailable>()
+            .is_some()
+        {
+            tracing::error!(error = %format!("{error:#}"), "Rule evaluator unavailable");
+            return Self(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+        }
+        if error
             .downcast_ref::<crate::evaluator::EvaluatorBusy>()
             .is_some()
         {
