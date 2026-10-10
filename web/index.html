@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Scheduler · 调度控制台</title>
+  <link rel="stylesheet" href="/console/style.css">
+  <script type="module" src="/console/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳转到内容</a>
+  <section id="login-screen" class="login-screen">
+    <div class="login-story">
+      <a class="brand" href="/console/"><span class="brand-mark" aria-hidden="true">S</span> Scheduler <span class="edition">SERVICE</span></a>
+      <div class="story-content"><p class="eyebrow">时间有序，任务有据</p><h1>把每一次执行，<br>交给可靠的计划。</h1><p class="story-copy">从一次延迟提醒，到跨时区的周期任务。<br>统一安排、追踪执行，让重试有迹可循。</p>
+        <div class="timeline" aria-label="调度流程"><span><i></i>创建计划</span><span><i></i>到期入队</span><span><i></i>投递与追踪</span></div>
+      </div>
+      <p class="story-footer">RUST + POSTGRESQL <span>CRON / DELAY / RRULE</span></p>
+    </div>
+    <div class="login-side"><form id="login-form" class="login-card">
+      <p class="eyebrow">工作空间</p><h2>连接调度服务</h2><p class="muted">使用你的租户 API key 进入控制台。</p>
+      <label for="api-key">API key</label><input id="api-key" type="password" autocomplete="off" spellcheck="false" required placeholder="输入租户密钥" maxlength="4096">
+      <p class="field-help">密钥仅保存在当前页面内存，刷新或退出后清除。</p>
+      <p id="login-error" class="error" role="alert" hidden></p>
+      <button class="primary wide" id="connect-button" type="submit">连接工作空间 <span aria-hidden="true">→</span></button>
+      <p class="login-endpoint">连接地址 <code id="endpoint"></code></p>
+    </form></div>
+  </section>
+
+  <div id="workspace" class="workspace" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/console/"><span class="brand-mark" aria-hidden="true">S</span> Scheduler</a>
+      <p class="nav-label">工作空间</p>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-view="schedules" aria-current="page"><span aria-hidden="true">◷</span> 调度计划 <span class="nav-count" id="schedule-count">0</span></button>
+        <button class="nav-item" data-view="runs"><span aria-hidden="true">≡</span> 执行记录</button>
+      </nav>
+      <div class="sidebar-note"><span class="status-dot" aria-hidden="true"></span><strong>持久化调度</strong><p>Cron、延迟与 RRULE<br>共用一个执行队列。</p></div>
+      <div class="tenant-card"><span class="tenant-avatar" aria-hidden="true">T</span><div><small>当前租户</small><strong id="tenant-name"></strong></div><button id="logout" class="icon-button" aria-label="退出工作空间" title="退出">↗</button></div>
+    </aside>
+    <div class="workspace-body">
+      <header class="topbar"><span>工作空间 <span class="slash">/</span> <strong id="breadcrumb">调度计划</strong></span><div class="topbar-right"><span id="connection-state" class="connection"><i></i> 已连接</span><span class="timezone-label">时间显示：浏览器时区</span></div></header>
+      <main id="main-content" tabindex="-1">
+        <div class="page-heading"><div><p class="eyebrow">SCHEDULER OVERVIEW</p><h1 id="page-title">调度计划</h1><p id="page-description" class="muted">安排下一次执行，掌握每一个周期。</p></div></div>
+        <section class="stats-grid" aria-label="当前租户统计">
+          <article class="stat-card"><span>运行中的计划</span><strong id="stat-active">—</strong><small>等待下一个触发时间</small></article>
+          <article class="stat-card"><span>等待执行</span><strong id="stat-pending">—</strong><small>已生成的待投递实例</small></article>
+          <article class="stat-card"><span>投递成功</span><strong id="stat-succeeded">—</strong><small>保留历史中的成功实例</small></article>
+          <article class="stat-card attention"><span>失败终止</span><strong id="stat-dead">—</strong><small>重试耗尽或已过有效期</small></article>
+        </section>
+        <section class="list-panel" aria-labelledby="list-title">
+          <div class="panel-header"><h2 id="list-title">全部计划</h2><div class="refresh-tools"><span id="last-refreshed">尚未刷新</span><label class="check-label"><input id="auto-refresh" type="checkbox" checked> 自动刷新</label><button id="refresh" class="secondary compact">刷新</button></div></div>
+          <form id="filters" class="filters">
+            <label id="search-field" class="search-field"><span class="sr-only">搜索计划</span><span aria-hidden="true">⌕</span><input id="search" placeholder="搜索计划名称或完整 ID" maxlength="200" type="search"></label>
+            <label id="run-schedule-field" hidden>计划 ID<input id="run-schedule-id" placeholder="按计划 ID 筛选" spellcheck="false"></label>
+            <label class="filter-status"><span class="sr-only">状态筛选</span><select id="status-filter" aria-label="状态筛选"></select></label>
+            <button class="secondary" type="submit">筛选</button><button id="clear-filters" class="text-button" type="button">清除</button>
+          </form>
+          <p id="list-error" class="error panel-message" role="alert" hidden></p>
+          <div id="loading" class="empty-state" role="status" hidden>正在读取工作空间…</div>
+          <div id="empty-state" class="empty-state" hidden><div class="empty-icon" aria-hidden="true">◷</div><h3 id="empty-title">还没有调度计划</h3><p id="empty-description">通过 API 创建计划后，可在这里查看执行情况。</p></div>
+          <div id="table-wrap" class="table-wrap" hidden><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+          <footer class="pagination"><span id="page-summary">每页 20 条</span><div><button id="previous-page" class="secondary compact" disabled>上一页</button><button id="next-page" class="secondary compact" disabled>下一页</button></div></footer>
+        </section>
+        <p class="workspace-footnote">HTTP 投递采用至少一次语义，请在接收端按 run_id 实现幂等。</p>
+      </main>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <noscript>控制台需要启用 JavaScript。也可以使用 HTTP API 管理计划。</noscript>
+</body>
+</html>

@@ -117,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{id}/replay", post(replay))
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
+        .route("/me", get(identity))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route(
@@ -127,6 +128,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/ready", get(ready))
+        .merge(crate::console::router())
         .nest("/v1", protected)
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, "Route not found".into()) })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -283,6 +285,8 @@ struct ScheduleQuery {
     limit: i64,
     #[serde(default)]
     offset: i64,
+    status: Option<String>,
+    q: Option<String>,
 }
 fn page_size() -> i64 {
     50
@@ -297,10 +301,35 @@ async fn list_schedules(
             "limit must be 1..100; offset must be 0..100000",
         ));
     }
+    if query.status.as_ref().is_some_and(|s| {
+        !matches!(
+            s.as_str(),
+            "active" | "paused" | "completed" | "cancelled" | "error"
+        )
+    }) {
+        return Err(ApiError::bad("Unknown schedule status"));
+    }
+    if query
+        .q
+        .as_ref()
+        .is_some_and(|q| q.len() > 200 || q.chars().any(char::is_control))
+    {
+        return Err(ApiError::bad(
+            "q must contain at most 200 bytes without control characters",
+        ));
+    }
     Ok(Json(
         state
             .store
-            .list_schedules(&tenant.0, query.limit, query.offset)
+            .search_schedules(
+                &tenant.0,
+                crate::store::ScheduleFilter {
+                    status: query.status.as_deref(),
+                    query: query.q.as_deref().map(str::trim),
+                },
+                query.limit,
+                query.offset,
+            )
             .await?,
     ))
 }
@@ -421,4 +450,8 @@ async fn metrics(
         state.store.metrics(&tenant.0).await?,
     )
         .into_response())
+}
+
+async fn identity(Extension(tenant): Extension<Tenant>) -> Json<Value> {
+    Json(json!({"tenant_id": tenant.0}))
 }

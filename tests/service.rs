@@ -3196,3 +3196,223 @@ mod metrics_tests {
         );
     }
 }
+
+mod console_tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::{DateTime, Utc};
+    use http_body_util::BodyExt;
+    use scheduler_service::{
+        api::{self, AppState},
+        domain::{
+            ConcurrencyPolicy, HttpTarget, MisfirePolicy, RetryPolicy, ScheduleSpec, Trigger,
+        },
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    use super::evaluator;
+    fn app(store: Store) -> Router {
+        api::router(AppState::new(
+            store,
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ))
+    }
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Value,
+        idempotency: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = idempotency {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body)}));
+        (status, value)
+    }
+    #[tokio::test]
+    async fn console_assets_are_embedded_and_do_not_change_the_root_api() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let app = app(Store { pool });
+        for (path, content_type, content) in [
+            ("/console", "text/html", "调度控制台"),
+            ("/console/", "text/html", "login-form"),
+            ("/console/app.js", "text/javascript", "createElement"),
+            ("/console/style.css", "text/css", "@media"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(content_type)
+            );
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            let csp = response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap();
+            assert!(csp.contains("frame-ancestors 'none'"));
+            assert!(!csp.contains("unsafe-inline"));
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains(content));
+        }
+        let (status, root) = request(&app, "GET", "/", None, Value::Null, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(root["service"], "scheduler-service");
+        assert_eq!(
+            request(&app, "GET", "/v1/me", None, Value::Null, None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (_, identity) = request(
+            &app,
+            "GET",
+            "/v1/me",
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(identity, json!({"tenant_id": "tenant-a"}));
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn schedule_search_is_literal_paginated_and_tenant_scoped(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap() + chrono::Duration::days(1);
+        let mut job = spec(at);
+        job.name = "Invoices 100%_Paid".into();
+        let first = store
+            .create("tenant-a", job.clone(), at, None, "test")
+            .await
+            .unwrap();
+        let paused = store
+            .create("tenant-a", job.clone(), at, None, "test")
+            .await
+            .unwrap();
+        store
+            .transition("tenant-a", paused.id, "pause")
+            .await
+            .unwrap();
+        store
+            .create("tenant-b", job.clone(), at, None, "test")
+            .await
+            .unwrap();
+        job.name = "Invoices 100XXPaid".into();
+        store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        let app = app(store);
+        let (status, rows) = request(
+            &app,
+            "GET",
+            "/v1/schedules?q=100%25_&status=active",
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["id"], first.id.to_string());
+        let (_, rows) = request(
+            &app,
+            "GET",
+            "/v1/schedules?q=invoices&limit=1&offset=1",
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        let (_, rows) = request(
+            &app,
+            "GET",
+            &format!("/v1/schedules?q={}", paused.id),
+            Some("tenant-b-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(rows, json!([]));
+        for uri in [
+            "/v1/schedules?status=running",
+            "/v1/schedules?q=%00",
+            "/v1/schedules?schedule_id=bad",
+            "/v1/runs?status=active",
+        ] {
+            assert_eq!(
+                request(
+                    &app,
+                    "GET",
+                    uri,
+                    Some("tenant-a-test-secret"),
+                    Value::Null,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+    }
+}

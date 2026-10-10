@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions, types::Json};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
 use crate::domain::{Attempt, DeliveryResult, Run, Schedule, ScheduleSpec};
@@ -109,11 +109,8 @@ impl Store {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Schedule>> {
-        Ok(sqlx::query_as("SELECT * FROM schedules WHERE tenant_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3")
-            .bind(tenant)
-            .bind(limit.clamp(1, 100))
-            .bind(offset.clamp(0, 100_000))
-            .fetch_all(&self.pool).await?)
+        self.search_schedules(tenant, ScheduleFilter::default(), limit, offset)
+            .await
     }
 
     async fn lock_schedule(
@@ -548,6 +545,32 @@ impl Store {
         }
         Ok(output)
     }
+    pub async fn search_schedules(
+        &self,
+        tenant: &str,
+        filter: ScheduleFilter<'_>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Schedule>> {
+        let mut sql = QueryBuilder::<Postgres>::new("SELECT * FROM schedules WHERE tenant_id = ");
+        sql.push_bind(tenant);
+        if let Some(status) = filter.status {
+            sql.push(" AND status = ").push_bind(status);
+        }
+        if let Some(query) = filter.query {
+            // position treats %, _ and backslashes as literal characters.
+            sql.push(" AND (position(lower(")
+                .push_bind(query)
+                .push(") in lower(spec->>'name')) > 0 OR id::text = ")
+                .push_bind(query)
+                .push(")");
+        }
+        sql.push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(limit.clamp(1, 100))
+            .push(" OFFSET ")
+            .push_bind(offset.clamp(0, 100_000));
+        Ok(sql.build_query_as().fetch_all(&self.pool).await?)
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -567,4 +590,10 @@ struct MetricsSnapshot {
     oldest: f64,
     expired: i64,
     due: f64,
+}
+
+#[derive(Default)]
+pub struct ScheduleFilter<'a> {
+    pub status: Option<&'a str>,
+    pub query: Option<&'a str>,
 }

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod console;
 pub mod dispatch;
 pub mod domain;
 pub mod engine;
