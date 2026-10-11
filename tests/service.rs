@@ -3933,3 +3933,216 @@ mod security_regression_tests {
             .unwrap();
     }
 }
+
+mod history_tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use chrono::{DateTime, Utc};
+    use http_body_util::BodyExt;
+    use scheduler_service::{
+        api::{self, AppState},
+        domain::{
+            ConcurrencyPolicy, HttpTarget, MisfirePolicy, RetryPolicy, Schedule, ScheduleSpec,
+            Trigger,
+        },
+        store::Store,
+    };
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    use super::evaluator;
+    fn app(store: Store) -> Router {
+        api::router(AppState::new(
+            store,
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ))
+    }
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Value,
+        idempotency: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = idempotency {
+            builder = builder.header("idempotency-key", key);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body)}));
+        (status, value)
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn attempt_history_is_bounded_cursor_paginated_and_tenant_scoped(pool: PgPool) {
+        let store = Store { pool };
+        let schedule = create_run(&store).await;
+        let run = store
+            .list_runs("tenant-a", Some(schedule.id), None, 1, 0)
+            .await
+            .unwrap()
+            .remove(0);
+        sqlx::query("INSERT INTO attempts (id, run_id, number, status, lease_token, response_excerpt) SELECT gen_random_uuid(), $1, n, 'failed', gen_random_uuid(), repeat('x', 4096) FROM generate_series(1, 201) AS n")
+        .bind(run.id).execute(&store.pool).await.unwrap();
+        let app = app(store.clone());
+        let path = format!("/v1/runs/{}/attempts", run.id);
+        let (status, latest) = request(
+            &app,
+            "GET",
+            &path,
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(latest.as_array().unwrap().len(), 50);
+        assert_eq!(latest[0]["number"], 152);
+        assert_eq!(latest[49]["number"], 201);
+        let (status, older) = request(
+            &app,
+            "GET",
+            &format!("{path}?before_number=152&limit=100"),
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(older.as_array().unwrap().len(), 100);
+        assert_eq!(older[0]["number"], 52);
+        assert_eq!(older[99]["number"], 151);
+        // New attempts do not shift an older page's cursor boundary.
+        sqlx::query("INSERT INTO attempts (id, run_id, number, status, lease_token) VALUES (gen_random_uuid(), $1, 202, 'failed', gen_random_uuid())")
+        .bind(run.id).execute(&store.pool).await.unwrap();
+        let (_, repeated) = request(
+            &app,
+            "GET",
+            &format!("{path}?before_number=152&limit=100"),
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(older, repeated);
+        let (_, first) = request(
+            &app,
+            "GET",
+            &format!("{path}?before_number=52&limit=100"),
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(first.as_array().unwrap().len(), 51);
+        assert_eq!(first[0]["number"], 1);
+        assert_eq!(first[50]["number"], 51);
+        let (_, empty) = request(
+            &app,
+            "GET",
+            &format!("{path}?before_number=1"),
+            Some("tenant-a-test-secret"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(empty, json!([]));
+        for query in [
+            "limit=0",
+            "limit=101",
+            "before_number=0",
+            "before_number=-1",
+            "before_number=2147483648",
+            "unknown=1",
+        ] {
+            assert_eq!(
+                request(
+                    &app,
+                    "GET",
+                    &format!("{path}?{query}"),
+                    Some("tenant-a-test-secret"),
+                    Value::Null,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                &path,
+                Some("tenant-b-test-secret"),
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+}

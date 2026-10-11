@@ -515,12 +515,31 @@ async fn get_run(
 ) -> Result<Json<Run>> {
     Ok(Json(state.store.get_run(&tenant.0, id).await?))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptQuery {
+    #[serde(default = "page_size")]
+    limit: i64,
+    before_number: Option<i32>,
+}
+
 async fn attempts(
     State(state): State<AppState>,
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<Uuid>,
+    Query(query): Query<AttemptQuery>,
 ) -> Result<Json<Vec<Attempt>>> {
-    Ok(Json(state.store.attempts(&tenant.0, id).await?))
+    if !(1..=100).contains(&query.limit) || query.before_number.is_some_and(|n| n < 1) {
+        return Err(ApiError::bad(
+            "limit must be 1..100 and before_number must be positive",
+        ));
+    }
+    Ok(Json(
+        state
+            .store
+            .list_attempts(&tenant.0, id, query.limit, query.before_number)
+            .await?,
+    ))
 }
 
 async fn replay(

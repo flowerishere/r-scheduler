@@ -369,13 +369,7 @@ impl Store {
             .bind(tenant).bind(schedule).bind(status).bind(limit).bind(offset).fetch_all(&self.pool).await?)
     }
     pub async fn attempts(&self, tenant: &str, id: Uuid) -> Result<Vec<Attempt>> {
-        self.get_run(tenant, id).await?;
-        Ok(
-            sqlx::query_as("SELECT * FROM attempts WHERE run_id=$1 ORDER BY number")
-                .bind(id)
-                .fetch_all(&self.pool)
-                .await?,
-        )
+        self.list_attempts(tenant, id, 100, None).await
     }
     pub async fn replay(&self, tenant: &str, id: Uuid) -> Result<Run> {
         let snapshot = self.get_run(tenant, id).await?;
@@ -570,6 +564,28 @@ impl Store {
             .push(" OFFSET ")
             .push_bind(offset.clamp(0, 100_000));
         Ok(sql.build_query_as().fetch_all(&self.pool).await?)
+    }
+    pub async fn list_attempts(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        limit: i64,
+        before_number: Option<i32>,
+    ) -> Result<Vec<Attempt>> {
+        self.get_run(tenant, id).await?;
+        // Replay retains history, so max_attempts does not bound the total row
+        // count. Use the existing (run_id, number) index and a strict cursor.
+        let before = before_number
+            .map(i64::from)
+            .unwrap_or(i64::from(i32::MAX) + 1);
+        Ok(
+            sqlx::query_as("SELECT * FROM (SELECT * FROM attempts WHERE run_id = $1 AND number < $2::bigint ORDER BY number DESC LIMIT $3) AS page ORDER BY number")
+                .bind(id)
+                .bind(before)
+                .bind(limit.clamp(1, 100))
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 }
 

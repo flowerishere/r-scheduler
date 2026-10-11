@@ -413,3 +413,56 @@ test("large integer payloads survive create, display and unrelated edits", async
   expect(JSON.parse(stored).spec.payload.text).toBe("9007199254740993");
   expect(await page.evaluate(() => Object.prototype.id)).toBeUndefined();
 });
+
+test("attempt history pages stay bounded and late pages cannot replace refreshed details", async ({page, request}) => {
+  const schedule = await create(request, "browser-paged-attempt-history", {
+    trigger: {type: "delay", seconds: 0}, target: {url: callback.replace("/ok", "/fail")},
+    retry: {max_attempts: 1, initial_delay_seconds: 1, max_delay_seconds: 1},
+  });
+  let run;
+  await expect.poll(async () => {
+    const runs = await (await request.get(`/v1/runs?schedule_id=${schedule.id}`, {headers: auth()})).json();
+    run = runs[0]; return run?.status;
+  }).toBe("dead");
+  const rows = Array.from({length: 121}, (_, index) => ({
+    number: index + 1, status: "failed", http_status: 503, started_at: run.created_at, finished_at: run.created_at,
+    response_excerpt: "<img src=x onerror=alert(1)>",
+  }));
+  let release, delayOlder = false;
+  await page.route(`**/v1/runs/${run.id}/attempts*`, async (route) => {
+    const before = Number(new URL(route.request().url()).searchParams.get("before_number") || Infinity);
+    if (delayOlder && before === 72) await new Promise((resolve) => { release = resolve; });
+    await route.fulfill({json: rows.filter((row) => row.number < before).slice(-50)});
+  });
+  await login(page); await search(page, schedule.id);
+  await page.locator("tbody").getByRole("button", {name: "详情", exact: true}).click();
+  await page.locator("#detail-actions").getByRole("button", {name: "执行记录", exact: true}).click();
+  await page.locator("tbody").getByRole("button", {name: "详情", exact: true}).click();
+  const cards = page.locator(".attempt-card");
+  await expect(cards).toHaveCount(50);
+  await expect(cards.first()).toContainText("第 72 次尝试");
+  await expect(cards.last()).toContainText("第 121 次尝试");
+  await expect(page.locator(".attempt-card img")).toHaveCount(0);
+  await expect(page.getByRole("button", {name: "较新记录", exact: true})).toBeDisabled();
+  await page.getByRole("button", {name: "更早记录", exact: true}).click();
+  await expect(cards).toHaveCount(50);
+  await expect(cards.first()).toContainText("第 22 次尝试");
+  await page.getByRole("button", {name: "更早记录", exact: true}).click();
+  await expect(cards).toHaveCount(21);
+  await expect(cards.first()).toContainText("第 1 次尝试");
+  await expect(page.getByRole("button", {name: "更早记录", exact: true})).toBeDisabled();
+  await page.getByRole("button", {name: "较新记录", exact: true}).click();
+  await expect(cards.first()).toContainText("第 22 次尝试");
+  await page.getByRole("button", {name: "较新记录", exact: true}).click();
+  await expect(cards.first()).toContainText("第 72 次尝试");
+  delayOlder = true;
+  await page.getByRole("button", {name: "更早记录", exact: true}).click();
+  await expect.poll(() => Boolean(release)).toBe(true);
+  await page.getByRole("button", {name: "刷新详情", exact: true}).click();
+  await expect(cards.first()).toContainText("第 72 次尝试");
+  const oldResponse = page.waitForResponse((response) => response.url().includes("attempts?before_number=72"));
+  release();
+  await oldResponse;
+  await expect(cards).toHaveCount(50);
+  await expect(cards.first()).toContainText("第 72 次尝试");
+});

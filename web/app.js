@@ -376,18 +376,43 @@ function reportActionError(error) {
 
 function fact(grid, title, value) { const group = node("div"); const description = node("dd"); description.append(value instanceof Node ? value : document.createTextNode(String(value ?? "—"))); group.append(node("dt", title), description); grid.append(group); }
 function section(title, content) { const wrapper = node("section", null, "detail-section"); wrapper.append(node("h3", title), content); return wrapper; }
-function attemptHistory(_id, rows, _detail) {
-  const timeline = node("div");
-  if (!rows.length) timeline.append(node("p", "尚无投递记录。", "muted"));
-  for (const attempt of rows) {
-    const card = node("article", null, "attempt-card"), title = node("div", null, "attempt-title");
-    title.append(node("strong", `第 ${attempt.number} 次尝试`), badge(attempt.status));
-    card.append(title, node("p", `${date(attempt.started_at)} → ${date(attempt.finished_at)}`));
-    if (attempt.http_status) card.append(node("p", `HTTP ${attempt.http_status}`));
-    if (attempt.error) card.append(node("p", attempt.error));
-    if (attempt.response_excerpt) card.append(node("pre", attempt.response_excerpt));
-    timeline.append(card);
+function attemptHistory(id, initial, detail) {
+  const timeline = node("div"), cursors = [null];
+  let loading = false;
+  const current = () => detail === state.detail && $("detail").open;
+  async function load(before, older, button) {
+    if (loading) return;
+    loading = true; button.disabled = true;
+    try {
+      const query = before === null ? "" : `?before_number=${before}`;
+      const rows = await api(`/runs/${id}/attempts${query}`);
+      if (!current()) return;
+      if (older) cursors.push(before); else cursors.pop();
+      render(rows);
+    } catch (error) { if (current() && !silent(error)) reportActionError(error); }
+    finally { loading = false; button.disabled = false; }
   }
+  function render(rows) {
+    timeline.replaceChildren();
+    if (!rows.length) timeline.append(node("p", "尚无投递记录。", "muted"));
+    else timeline.append(node("p", `第 ${rows[0].number}–${rows.at(-1).number} 次尝试（本页 ${rows.length} 条）`, "muted"));
+    const pages = node("div", null, "toolbar");
+    const earlier = action("更早记录", (button) => load(rows[0].number, true, button));
+    earlier.disabled = !rows.length || rows[0].number <= 1;
+    const newer = action("较新记录", (button) => load(cursors.at(-2), false, button));
+    newer.disabled = cursors.length < 2;
+    pages.append(earlier, newer); timeline.append(pages);
+    for (const attempt of rows) {
+      const card = node("article", null, "attempt-card"), title = node("div", null, "attempt-title");
+      title.append(node("strong", `第 ${attempt.number} 次尝试`), badge(attempt.status));
+      card.append(title, node("p", `${date(attempt.started_at)} → ${date(attempt.finished_at)}`));
+      if (attempt.http_status) card.append(node("p", `HTTP ${attempt.http_status}`));
+      if (attempt.error) card.append(node("p", attempt.error));
+      if (attempt.response_excerpt) card.append(node("pre", attempt.response_excerpt));
+      timeline.append(card);
+    }
+  }
+  render(initial);
   return timeline;
 }
 async function openDetail(kind, id) {
