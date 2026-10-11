@@ -108,6 +108,9 @@ def main():
             assert "text/html" in response.headers["Content-Type"]
             assert "调度控制台" in response.read().decode()
         assert api("/v1/me")["tenant_id"] == "smoke"
+        with opener.open(base + "/console/json.js", timeout=5) as response:
+            assert "text/javascript" in response.headers["Content-Type"]
+            assert "parseExactJson" in response.read().decode()
         preview = api("/v1/preview", {
             "trigger": {"type": "rrule", "value": "DTSTART;TZID=Asia/Shanghai:20260930T090000\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1\nEXDATE;TZID=Asia/Shanghai:20261030T090000"},
             "after": "2026-09-21T00:00:00Z", "count": 3,

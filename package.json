@@ -8,7 +8,8 @@
   },
   "scripts": {
     "test:ui": "playwright test",
-    "test:ui:report": "playwright show-report"
+    "test:ui:report": "playwright show-report",
+    "test:json": "node --test tests/json.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"

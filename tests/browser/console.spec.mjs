@@ -360,3 +360,56 @@ test("invalid fields in collapsed advanced options are revealed", async ({page})
   await page.getByRole("button", {name: "创建计划", exact: true}).click();
   await expect(page.locator("#editor")).toBeHidden();
 });
+
+test("out-of-range payload numbers cannot silently become null", async ({page, request}) => {
+  await login(page);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("overflow-must-not-be-null");
+  await page.getByLabel("目标 URL").fill(callback);
+  for (const payload of ['{"amount":1e400}', '[0,{"amount":-1e400}]']) {
+    await page.locator("#payload").fill(payload);
+    await page.getByRole("button", {name: "创建计划", exact: true}).click();
+    await expect(page.locator("#editor-error")).toBeVisible();
+    await expect(page.locator("#editor")).toBeVisible();
+    await expect(page.locator("#payload")).toHaveValue(payload);
+    const response = await request.get("/v1/schedules?q=overflow-must-not-be-null", {headers: auth()});
+    expect(await response.json()).toEqual([]);
+  }
+  await page.locator("#payload").fill('{"amount":"1e400","optional":null,"value":1.5}');
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  await expect(page.locator("#editor")).toBeHidden();
+});
+
+test("large integer payloads survive create, display and unrelated edits", async ({page, request}) => {
+  const raw = '{"id":18446744073709551615,"nested":[-9223372036854775808,9007199254740993],"text":"9007199254740993","__proto__":{"id":9007199254740995}}';
+  await login(page);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("precise-payload-create");
+  await page.getByLabel("目标 URL").fill(callback);
+  await page.locator("#payload").fill(raw);
+  const sent = page.waitForRequest((r) => r.method() === "POST" && r.url().endsWith("/v1/schedules"));
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  const data = (await sent).postData();
+  expect(typeof JSON.parse(data).payload.id).toBe("number");
+  expect(JSON.parse(data).payload.nested.every((value) => typeof value === "number")).toBe(true);
+  for (const number of ["18446744073709551615", "-9223372036854775808", "9007199254740993", "9007199254740995"]) expect(data).toContain(number);
+  await expect(page.locator("#editor")).toBeHidden();
+  const response = await request.post("/v1/schedules", {headers: {...auth(), "Content-Type": "application/json"}, data:
+    `{"name":"precise-payload-edit","trigger":{"type":"delay","seconds":86400},"target":{"url":${JSON.stringify(callback)}},"payload":${raw}}`});
+  expect(response.ok()).toBeTruthy();
+  const schedule = await response.json();
+  await search(page, schedule.id);
+  await page.locator("tbody").getByRole("button", {name: "详情", exact: true}).click();
+  await expect(page.locator("#detail-content")).toContainText("18446744073709551615");
+  await page.getByRole("button", {name: "编辑计划", exact: true}).click();
+  await expect(page.locator("#payload")).toHaveValue(/9007199254740993/);
+  await page.getByLabel("计划名称", {exact: true}).fill("precise-payload-renamed");
+  await page.getByRole("button", {name: "保存修改"}).click();
+  await expect(page.locator("#editor")).toBeHidden();
+  const stored = await (await request.get(`/v1/schedules/${schedule.id}`, {headers: auth()})).text();
+  for (const number of ["18446744073709551615", "-9223372036854775808", "9007199254740993", "9007199254740995"]) expect(stored).toContain(number);
+  expect(typeof JSON.parse(stored).spec.payload.id).toBe("number");
+  expect(JSON.parse(stored).spec.payload.nested.every((value) => typeof value === "number")).toBe(true);
+  expect(JSON.parse(stored).spec.payload.text).toBe("9007199254740993");
+  expect(await page.evaluate(() => Object.prototype.id)).toBeUndefined();
+});

@@ -1,3 +1,4 @@
+import {parseExactJson, stringifyExactJson} from "./json.js";
 
 const $ = (id) => document.getElementById(id);
 const statuses = {active: "运行中", paused: "已暂停", completed: "已生成完毕", cancelled: "已取消", error: "规则错误", pending: "待执行", running: "投递中", succeeded: "成功", dead: "失败终止", failed: "失败", lease_expired: "租约过期"};
@@ -21,7 +22,7 @@ function action(text, handler, className = "secondary compact") {
   const button = node("button", text, className); button.type = "button";
   button.addEventListener("click", () => void handler(button)); return button;
 }
-function jsonBox(value) { return node("pre", JSON.stringify(value, null, 2), "json-box"); }
+function jsonBox(value) { return node("pre", stringifyExactJson(value, 2), "json-box"); }
 function silent(error) { return error?.name === "AbortError"; }
 
 async function api(path, {method = "GET", body, idempotency} = {}) {
@@ -33,11 +34,11 @@ async function api(path, {method = "GET", body, idempotency} = {}) {
     const headers = {Authorization: `Bearer ${state.key}`};
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (idempotency) headers["Idempotency-Key"] = idempotency;
-    const response = await fetch(`/v1${path}`, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, cache: "no-store", credentials: "omit", redirect: "error"});
+    const response = await fetch(`/v1${path}`, {method, headers, body: body === undefined ? undefined : stringifyExactJson(body), signal: controller.signal, cache: "no-store", credentials: "omit", redirect: "error"});
     const text = await response.text();
     if (session !== state.session) throw new DOMException("Session changed", "AbortError");
     let data;
-    try { data = JSON.parse(text); } catch { data = {error: text || `HTTP ${response.status}`}; }
+    try { data = parseExactJson(text); } catch { data = {error: text || `HTTP ${response.status}`}; }
     if (!response.ok) {
       const error = new Error(response.status === 409 ? `版本或状态冲突：${data.error}` : data.error || `HTTP ${response.status}`);
       error.status = response.status;
@@ -236,7 +237,7 @@ function openEditor(schedule = null) {
     if (spec.trigger.type === "cron") { $("cron-expression").value = spec.trigger.expression; $("cron-timezone").value = spec.trigger.timezone; }
     if (spec.trigger.type === "rrule") $("rrule-value").value = spec.trigger.value;
     $("target-url").value = spec.target.url; $("target-headers").value = JSON.stringify(spec.target.headers, null, 2);
-    $("payload").value = JSON.stringify(spec.payload, null, 2); $("timeout-seconds").value = spec.target.timeout_seconds;
+    $("payload").value = stringifyExactJson(spec.payload, 2); $("timeout-seconds").value = spec.target.timeout_seconds;
     $("max-attempts").value = spec.retry.max_attempts; $("initial-delay").value = spec.retry.initial_delay_seconds;
     $("max-delay").value = spec.retry.max_delay_seconds; $("max-age").value = spec.retry.max_age_seconds ?? "";
     $("misfire").value = spec.misfire; $("misfire-grace").value = spec.misfire_grace_seconds; $("concurrency").value = spec.concurrency;
@@ -275,7 +276,7 @@ function readTrigger() {
 }
 function parseJson(id, label) {
   try {
-    return JSON.parse($(id).value);
+    return parseExactJson($(id).value);
   } catch (error) {
     if (error instanceof RangeError) throw new Error(`${label} 中的数字超出支持范围，请改用字符串传递。`);
     throw new Error(`${label} 不是有效的 JSON。`);
@@ -313,7 +314,7 @@ $("schedule-form").addEventListener("submit", async (event) => {
     const spec = readSpec();
     if (editing) await api(`/schedules/${editing.id}`, {method: "PUT", body: {expected_revision: editing.revision, spec}});
     else {
-      const encoded = JSON.stringify(spec);
+      const encoded = stringifyExactJson(spec);
       if (!state.creation || state.creation.encoded !== encoded) state.creation = {encoded, key: `console-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")}`};
       await api("/schedules", {method: "POST", body: spec, idempotency: state.creation.key});
     }

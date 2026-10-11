@@ -16,6 +16,15 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
             }),
         )
         .route(
+            "/console/json.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../web/json.js"),
+                )
+            }),
+        )
+        .route(
             "/console/style.css",
             get(|| async { asset("text/css; charset=utf-8", include_str!("../web/style.css")) }),
         )

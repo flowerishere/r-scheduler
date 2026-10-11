@@ -3289,6 +3289,7 @@ mod console_tests {
             ("/console", "text/html", "调度控制台"),
             ("/console/", "text/html", "login-form"),
             ("/console/app.js", "text/javascript", "createElement"),
+            ("/console/json.js", "text/javascript", "parseExactJson"),
             ("/console/style.css", "text/css", "@media"),
         ] {
             let response = app
