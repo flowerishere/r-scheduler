@@ -3804,3 +3804,132 @@ mod recurrence_tests {
         }
     }
 }
+
+mod security_regression_tests {
+    use super::evaluator;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use scheduler_service::{
+        api::{self, AppState},
+        store::Store,
+    };
+    use sqlx::PgPool;
+    use std::{collections::BTreeMap, time::Duration};
+    use tower::ServiceExt;
+    fn app(store: Store) -> Router {
+        api::router(AppState::new(
+            store,
+            evaluator(),
+            &BTreeMap::from([
+                ("tenant-a".into(), "tenant-a-test-secret".into()),
+                ("tenant-b".into(), "tenant-b-test-secret".into()),
+            ]),
+        ))
+    }
+    #[tokio::test]
+    async fn bearer_authentication_handles_scheme_case_and_rejects_ambiguity() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let app = app(Store { pool });
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR "] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/me")
+                        .header("authorization", format!("{scheme} tenant-a-test-secret"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{scheme}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+        for values in [
+            vec![],
+            vec!["Bearer TENANT-A-TEST-SECRET"],
+            vec!["Basic tenant-a-test-secret"],
+            vec!["Bearer tenant-a-test-secret", "Bearer tenant-b-test-secret"],
+            vec!["Bearer tenant-a-test-secret, Bearer tenant-b-test-secret"],
+        ] {
+            let mut builder = Request::builder().uri("/v1/me");
+            for value in values {
+                builder = builder.header("authorization", value);
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer realm=\"scheduler\"")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn stalled_tcp_upload_times_out_without_writing_and_allows_shutdown(pool: PgPool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let store = Store { pool };
+        let app = app(store.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(b"POST /v1/schedules HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tenant-a-test-secret\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(12),
+            socket.read_to_string(&mut response),
+        )
+        .await
+        .expect("server must send 408 and close the incomplete HTTP/1 connection")
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        assert!(response.contains("connection: close"), "{response}");
+        assert!(response.contains("cache-control: no-store"), "{response}");
+        assert!(
+            store
+                .list_schedules("tenant-a", 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
