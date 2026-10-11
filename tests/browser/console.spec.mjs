@@ -466,3 +466,19 @@ test("attempt history pages stay bounded and late pages cannot replace refreshed
   await expect(cards).toHaveCount(50);
   await expect(cards.first()).toContainText("第 72 次尝试");
 });
+
+test("delivery capacity is visible and cleared when switching tenants", async ({page}) => {
+  await page.route("**/v1/capacity", (route) => route.fulfill({json: {
+    tenant_id: "console", max_concurrent: 2, rate_per_second: 3, burst: 6,
+    running: 1, available_tokens: 2.5,
+  }}));
+  await login(page);
+  await expect(page.locator("#delivery-capacity")).toContainText("正在投递 1 / 2");
+  await expect(page.locator("#delivery-capacity")).toContainText("每秒 3 次，最多突发 6 次");
+  await page.getByRole("button", {name: "退出工作空间"}).click();
+  await expect(page.locator("#delivery-capacity")).toHaveText("—");
+  await page.unroute("**/v1/capacity");
+  await login(page, otherKey);
+  await expect(page.locator("#delivery-capacity")).toContainText("正在投递 0 / 不限");
+  await expect(page.locator("#delivery-capacity")).toContainText("速率不限");
+});

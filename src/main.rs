@@ -4,7 +4,8 @@ use anyhow::Context;
 use clap::Parser;
 use scheduler_service::{
     api::{self, AppState},
-    config::{Cli, Command, Config, Role},
+    config::{Cli, Command, Config, Role, TenantCommand},
+    dispatch::TenantLimits,
     engine,
     evaluator::Evaluator,
     store::Store,
@@ -49,6 +50,32 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return Ok(());
         }
         Command::Evaluate => unreachable!(),
+        Command::Tenant { action } => {
+            let store = Store::connect(&config.database_url).await?;
+            let capacity = match action {
+                TenantCommand::Show { tenant } => store.tenant_capacity(&tenant).await?,
+                TenantCommand::Set {
+                    tenant,
+                    max_concurrent,
+                    rate_per_second,
+                    burst,
+                } => {
+                    store
+                        .set_tenant_limits(
+                            &tenant,
+                            &TenantLimits {
+                                max_concurrent,
+                                rate_per_second,
+                                burst,
+                            },
+                        )
+                        .await?
+                }
+            };
+            println!("{}", serde_json::to_string(&capacity)?);
+            store.pool.close().await;
+            return Ok(());
+        }
         Command::Cleanup {
             older_than_days,
             batch_size,

@@ -472,7 +472,7 @@ impl Store {
     pub async fn metrics(&self, tenant: &str) -> Result<String> {
         use std::fmt::Write;
         // Every gauge uses the same database snapshot.
-        let MetricsSnapshot { schedules, runs, ready, oldest, expired, due } = sqlx::query_as(
+        let MetricsSnapshot { schedules, runs, ready, oldest, expired, due, max_concurrent, rate, burst } = sqlx::query_as(
             "WITH ready AS (
                 SELECT r.available_at FROM runs r JOIN schedules s ON s.id = r.schedule_id
                 WHERE r.tenant_id = $1 AND r.status = 'pending' AND r.available_at <= statement_timestamp()
@@ -483,7 +483,9 @@ impl Store {
                 (SELECT COUNT(*) FROM ready) AS ready,
                 (SELECT COALESCE(EXTRACT(EPOCH FROM statement_timestamp() - MIN(available_at)), 0)::double precision FROM ready) AS oldest,
                 (SELECT COUNT(*) FROM runs WHERE tenant_id = $1 AND status = 'running' AND lease_until <= statement_timestamp()) AS expired,
-                (SELECT GREATEST(COALESCE(EXTRACT(EPOCH FROM statement_timestamp() - MIN(next_fire_at)), 0), 0)::double precision FROM schedules WHERE tenant_id = $1 AND status = 'active') AS due")
+                (SELECT GREATEST(COALESCE(EXTRACT(EPOCH FROM statement_timestamp() - MIN(next_fire_at)), 0), 0)::double precision FROM schedules WHERE tenant_id = $1 AND status = 'active') AS due,
+                t.max_concurrent, t.rate_per_second AS rate, t.burst
+             FROM (VALUES (1)) AS singleton(n) LEFT JOIN tenant_dispatch t ON t.tenant_id = $1")
             .bind(tenant).fetch_one(&self.pool).await?;
         let mut output = String::new();
         for (name, help, counts, statuses) in [
@@ -529,6 +531,25 @@ impl Store {
                 "scheduler_oldest_due_schedule_age_seconds",
                 "Age of the oldest unmaterialized active schedule cursor, or zero.",
                 due,
+            ),
+            (
+                "scheduler_delivery_concurrency_limit",
+                "Database-wide tenant delivery concurrency limit; zero means unlimited.",
+                f64::from(max_concurrent.unwrap_or(0)),
+            ),
+            (
+                "scheduler_delivery_rate_limit",
+                "Tenant admission tokens per second; zero means unlimited.",
+                f64::from(rate.unwrap_or(0)),
+            ),
+            (
+                "scheduler_delivery_burst_limit",
+                "Tenant admission bucket capacity; zero means rate limiting is disabled.",
+                f64::from(if rate.is_some() {
+                    burst.unwrap_or(1)
+                } else {
+                    0
+                }),
             ),
         ] {
             writeln!(
@@ -606,6 +627,9 @@ struct MetricsSnapshot {
     oldest: f64,
     expired: i64,
     due: f64,
+    max_concurrent: Option<i32>,
+    rate: Option<i32>,
+    burst: Option<i32>,
 }
 
 #[derive(Default)]

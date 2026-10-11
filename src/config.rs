@@ -28,9 +28,30 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Inspect or replace database-wide delivery limits for a tenant.
+    Tenant {
+        #[command(subcommand)]
+        action: TenantCommand,
+    },
     /// Internal isolated rule evaluator. JSON on stdin/stdout.
     #[command(hide = true)]
     Evaluate,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TenantCommand {
+    /// Show current limits, running deliveries and token balance.
+    Show { tenant: String },
+    /// Replace all limits; omitted concurrency/rate limits become unlimited.
+    Set {
+        tenant: String,
+        #[arg(long, value_parser = clap::value_parser!(i32).range(1..=4096))]
+        max_concurrent: Option<i32>,
+        #[arg(long, value_parser = clap::value_parser!(i32).range(1..=10000))]
+        rate_per_second: Option<i32>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(i32).range(1..=10000))]
+        burst: i32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

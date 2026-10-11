@@ -68,6 +68,7 @@ function logout(message = "") {
   state.editing = null; state.creation = null; state.offset = 0; state.filters = {};
   $("toast").hidden = true; hideError("editor-error"); hideError("list-error");
   for (const id of ["stat-active", "stat-pending", "stat-succeeded", "stat-dead", "schedule-count"]) $(id).textContent = "—";
+  $("delivery-capacity").textContent = "—";
   if (message) showError("login-error", message); else hideError("login-error");
   $("api-key").focus();
 }
@@ -155,13 +156,16 @@ async function refresh(background = false) {
   $("refresh").disabled = true;
   if (!background) { $("loading").hidden = false; $("table-wrap").hidden = true; $("empty-state").hidden = true; }
   try {
-    const [items, stats] = await Promise.all([api(`/${view}?${query}`), api("/stats")]);
+    const [items, stats, capacity] = await Promise.all([api(`/${view}?${query}`), api("/stats"), api("/capacity")]);
     if (!current()) return;
     $("stat-active").textContent = stats.schedules.active || 0;
     $("stat-pending").textContent = stats.runs.pending || 0;
     $("stat-succeeded").textContent = stats.runs.succeeded || 0;
     $("stat-dead").textContent = stats.runs.dead || 0;
     $("schedule-count").textContent = Object.values(stats.schedules).reduce((a, b) => a + Number(b), 0);
+    const concurrency = capacity.max_concurrent === null ? "不限" : capacity.max_concurrent;
+    const rate = capacity.rate_per_second === null ? "速率不限" : `每秒 ${capacity.rate_per_second} 次，最多突发 ${capacity.burst} 次`;
+    $("delivery-capacity").textContent = `投递配额：正在投递 ${capacity.running} / ${concurrency} · ${rate}`;
     renderRows(items.slice(0, PAGE_SIZE));
     $("previous-page").disabled = state.offset === 0;
     $("next-page").disabled = items.length <= PAGE_SIZE || state.offset + PAGE_SIZE > 100000;

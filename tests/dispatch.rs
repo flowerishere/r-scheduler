@@ -1,4 +1,16 @@
-//! Database-wide admission tests with isolated PostgreSQL.
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use scheduler_service::{
+    api::{self, AppState},
+    evaluator::Evaluator,
+    store::StoreError,
+};
+use serde_json::Value;
+use std::{collections::BTreeMap, time::Duration};
+use tower::ServiceExt;
+// Database-wide admission tests with isolated PostgreSQL.
 use chrono::{DateTime, Utc};
 use scheduler_service::{
     dispatch::TenantLimits,
@@ -315,4 +327,178 @@ async fn lease_recovery_releases_capacity_without_refunding_consumed_tokens(pool
     let second = store.claim().await.unwrap().unwrap();
     store.finish(&second, success()).await.unwrap();
     assert!(store.claim().await.unwrap().is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires PostgreSQL; run scripts/test.sh"]
+async fn capacity_api_is_tenant_scoped_read_only_and_has_unlimited_defaults(pool: PgPool) {
+    let store = Store { pool };
+    let app = api::router(AppState::new(
+        store.clone(),
+        Evaluator::new("unused".into(), Duration::from_secs(1)),
+        &BTreeMap::from([
+            ("a".into(), "tenant-a-test-secret".into()),
+            ("b".into(), "tenant-b-test-secret".into()),
+        ]),
+    ));
+    store
+        .set_tenant_limits(
+            "a",
+            &TenantLimits {
+                max_concurrent: Some(2),
+                rate_per_second: Some(3),
+                burst: 4,
+            },
+        )
+        .await
+        .unwrap();
+    for (key, tenant, cap) in [
+        ("tenant-a-test-secret", "a", json!(2)),
+        ("tenant-b-test-secret", "b", Value::Null),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity?tenant_id=a")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["tenant_id"], tenant);
+        assert_eq!(body["max_concurrent"], cap);
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/capacity")
+                .header("authorization", "Bearer tenant-a-test-secret")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let policies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenant_dispatch")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        policies, 1,
+        "reading an unused tenant must not create persistent state"
+    );
+    assert!(matches!(
+        store
+            .set_tenant_limits(
+                "a",
+                &TenantLimits {
+                    max_concurrent: Some(0),
+                    ..TenantLimits::default()
+                }
+            )
+            .await,
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert_eq!(
+        store.tenant_capacity("a").await.unwrap().max_concurrent,
+        Some(2)
+    );
+    let metrics = store.metrics("a").await.unwrap();
+    assert!(metrics.contains("scheduler_delivery_concurrency_limit 2\n"));
+    assert!(metrics.contains("scheduler_delivery_rate_limit 3\n"));
+    assert!(metrics.contains("scheduler_delivery_burst_limit 4\n"));
+    let other = store.metrics("b").await.unwrap();
+    assert!(other.contains("scheduler_delivery_concurrency_limit 0\n"));
+    assert!(other.contains("scheduler_delivery_rate_limit 0\n"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires PostgreSQL; run scripts/test.sh"]
+async fn tenant_cli_provisions_limits_before_first_schedule_and_validates_input(pool: PgPool) {
+    use sqlx::ConnectOptions;
+    let store = Store { pool };
+    let url = store.pool.connect_options().to_url_lossy().to_string();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+        .args([
+            "tenant",
+            "set",
+            "cli-tenant",
+            "--max-concurrent",
+            "2",
+            "--rate-per-second",
+            "1",
+            "--burst",
+            "2",
+        ])
+        .env_clear()
+        .env("DATABASE_URL", &url)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let capacity: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(capacity["max_concurrent"], 2);
+    assert_eq!(capacity["running"], 0);
+    batch(
+        &store,
+        "cli-tenant",
+        5,
+        store.now().await.unwrap() - chrono::Duration::minutes(1),
+    )
+    .await;
+    let policy = store.tenant_capacity("cli-tenant").await.unwrap();
+    assert_eq!(policy.max_concurrent, Some(2));
+    assert_eq!(policy.burst, 2);
+    let show = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+        .args(["tenant", "show", "cli-tenant"])
+        .env_clear()
+        .env("DATABASE_URL", &url)
+        .output()
+        .await
+        .unwrap();
+    assert!(show.status.success());
+    let shown: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["rate_per_second"], 1);
+    let invalid = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-service"))
+        .args(["tenant", "set", "cli-tenant", "--max-concurrent", "0"])
+        .env_clear()
+        .env("DATABASE_URL", &url)
+        .output()
+        .await
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert_eq!(
+        store
+            .tenant_capacity("cli-tenant")
+            .await
+            .unwrap()
+            .max_concurrent,
+        Some(2)
+    );
 }

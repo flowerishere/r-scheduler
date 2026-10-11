@@ -108,6 +108,12 @@ def main():
             assert "text/html" in response.headers["Content-Type"]
             assert "调度控制台" in response.read().decode()
         assert api("/v1/me")["tenant_id"] == "smoke"
+        assert api("/v1/capacity")["max_concurrent"] is None
+        configured = json.loads(docker("exec", service, "scheduler-service", "tenant", "set", "smoke",
+                                       "--max-concurrent", "1", "--rate-per-second", "2", "--burst", "2").stdout)
+        assert configured["max_concurrent"] == 1
+        assert api("/v1/capacity")["rate_per_second"] == 2
+        assert api("/v1/capacity", key="smoke-tenant-b-api-key")["max_concurrent"] is None
         with opener.open(base + "/console/json.js", timeout=5) as response:
             assert "text/javascript" in response.headers["Content-Type"]
             assert "parseExactJson" in response.read().decode()
@@ -153,7 +159,7 @@ def main():
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, tenant metrics, embedded console, stable idempotency key, graceful shutdown")
+        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, tenant metrics, embedded console, tenant capacity and administrator limits, stable idempotency key, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)

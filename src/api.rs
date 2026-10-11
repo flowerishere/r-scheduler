@@ -142,6 +142,7 @@ type Result<T> = std::result::Result<T, ApiError>;
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/me", get(identity))
+        .route("/capacity", get(capacity))
         .route("/preview", post(preview))
         .route("/schedules", post(create).get(list_schedules))
         .route("/schedules/{id}", get(get_schedule).put(replace))
@@ -568,6 +569,13 @@ async fn metrics(
         state.store.metrics(&tenant.0).await?,
     )
         .into_response())
+}
+
+async fn capacity(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+) -> Result<Json<crate::dispatch::TenantCapacity>> {
+    Ok(Json(state.store.tenant_capacity(&tenant.0).await?))
 }
 
 #[cfg(test)]
