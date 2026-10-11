@@ -72,7 +72,7 @@ async fn migrate_command_and_store_apply_initial_schema_idempotently(pool: sqlx:
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions, [1, 2]);
+    assert_eq!(versions, [1, 2, 3]);
     let store = Store::connect(&url).await.unwrap();
     let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
         .fetch_one(&store.pool)
@@ -2602,6 +2602,10 @@ mod expiry_tests {
         sqlx::query("INSERT INTO runs (id, schedule_id, tenant_id, revision, scheduled_at, available_at, status, spec) VALUES ($1, $2, 'tenant-a', 1, $3, $3, 'pending', $4)")
         .bind(run_id).bind(schedule.id).bind(schedule.next_fire_at).bind(&schedule.spec).execute(&store.pool).await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/0002_operations.sql"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0003_tenant_dispatch.sql"))
             .execute(&store.pool)
             .await
             .unwrap();
