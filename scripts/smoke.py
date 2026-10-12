@@ -122,6 +122,13 @@ def main():
             "after": "2026-09-21T00:00:00Z", "count": 3,
         })
         assert preview["dates"] == ["2026-09-30T01:00:00Z", "2026-11-30T01:00:00Z", "2026-12-31T01:00:00Z"]
+        try:
+            api("/v1/preview", {"trigger": {"type": "rrule", "value": "DTSTART;TZID=Asia/Shanghai:20300101T090000\nRRULE:FREQ=DAILY;COUNT=3\nEXDATE:20300102T090000"}})
+        except urllib.error.HTTPError as error:
+            assert error.code == 400
+            assert "Floating EXDATE" in error.read().decode()
+        else:
+            raise AssertionError("Floating EXDATE was accepted")
         job = {"name": "container smoke", "trigger": {"type": "delay", "seconds": 1},
                "metadata": {"order_id": "smoke-42", "env": "container"},
                "target": {"url": f"http://host.docker.internal:{receiver.server_port}/hook"},
@@ -165,7 +172,7 @@ def main():
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, embedded console, tenant identity/capacity, administrator limits, metadata filters/snapshot/isolation, RRULE, delayed delivery, Retry-After, idempotency, tenant metrics, expired run, cleanup preview, graceful shutdown")
+        print("PASS: image startup, migration, embedded console, tenant identity/capacity, administrator limits, metadata filters/snapshot/isolation, RRULE and explicit exception timezones, delayed delivery, Retry-After, idempotency, tenant metrics, expired run, cleanup preview, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)

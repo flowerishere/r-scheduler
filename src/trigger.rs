@@ -83,14 +83,33 @@ pub fn evaluate(request: EvaluationRequest) -> anyhow::Result<Evaluation> {
             }
             for (property, dates) in value.lines().filter_map(|line| line.trim().split_once(':')) {
                 let name = property.split(';').next().unwrap_or_default();
+                // rrule silently ignores EXRULE unless its optional feature is
+                // enabled. Reject it instead of scheduling excluded occurrences.
                 if name == "EXRULE" {
                     bail!("EXRULE is not supported; use explicit EXDATE values");
                 }
-                if matches!(name, "DTSTART" | "RDATE" | "EXDATE")
-                    && (property.split(';').any(|p| p == "VALUE=DATE")
-                        || dates.split(',').any(|date| !date.contains('T')))
-                {
-                    bail!("All-day {name} is not supported; specify DATE-TIME values");
+                if matches!(name, "DTSTART" | "RDATE" | "EXDATE") {
+                    if property
+                        .split(';')
+                        .any(|parameter| parameter == "VALUE=DATE")
+                        || dates.split(',').any(|date| !date.contains('T'))
+                    {
+                        bail!("All-day {name} is not supported; specify DATE-TIME values");
+                    }
+                    let has_timezone = property
+                        .split(';')
+                        .any(|parameter| parameter.starts_with("TZID="));
+                    for date in dates.split(',') {
+                        // Upstream uses the machine timezone for floating RDATE
+                        // and EXDATE; it does not inherit DTSTART's timezone.
+                        if !date.ends_with('Z') && !has_timezone {
+                            bail!("Floating {name} is not supported; specify UTC Z or TZID");
+                        }
+                        // Upstream silently ignores TZID when Z is present.
+                        if date.ends_with('Z') && has_timezone {
+                            bail!("{name} must use either UTC Z or TZID, not both");
+                        }
+                    }
                 }
             }
             let starts: Vec<_> = value
@@ -100,13 +119,6 @@ pub fn evaluate(request: EvaluationRequest) -> anyhow::Result<Evaluation> {
                 .collect();
             if starts.len() != 1 {
                 bail!("RRULE requires exactly one DTSTART with UTC Z or an explicit TZID");
-            }
-            let (property, date) = starts[0];
-            let has_timezone = property
-                .split(';')
-                .any(|parameter| parameter.starts_with("TZID="));
-            if !date.ends_with('Z') && !has_timezone {
-                bail!("Floating DTSTART is not supported; specify UTC Z or TZID");
             }
             let rules = RRuleSet::from_str(&value).context("Invalid RRULE set")?;
             if rules.get_rrule().len() > 4 {
@@ -355,6 +367,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn date_properties_cannot_depend_on_the_machine_timezone() {
+        for property in ["DTSTART", "RDATE", "EXDATE"] {
+            for suffix in [
+                ":20261025T090000",
+                ";VALUE=DATE-TIME:20261025T090000",
+                ";TZID=Asia/Shanghai:20261025T090000Z",
+            ] {
+                let line = format!("{property}{suffix}");
+                let value = if property == "DTSTART" {
+                    format!("{line}\nRRULE:FREQ=DAILY;COUNT=3")
+                } else {
+                    format!(
+                        "DTSTART;TZID=Asia/Shanghai:20261024T090000\nRRULE:FREQ=DAILY;COUNT=3\n{line}"
+                    )
+                };
+                let error = evaluate(EvaluationRequest {
+                    trigger: Trigger::Rrule { value },
+                    after: dt("2026-10-01T00:00:00Z"),
+                    count: 5,
+                })
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(property), "{line}: {error}");
+            }
+        }
+        // Validate every comma-separated value, including later floating dates.
+        let error = evaluate(EvaluationRequest {
+            trigger: Trigger::Rrule {
+                value: "DTSTART:20261024T090000Z\nRDATE:20261024T090000Z,20261025T090000".into(),
+            },
+            after: dt("2026-10-01T00:00:00Z"),
+            count: 5,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Floating RDATE"));
+    }
+
+    #[test]
+    fn exclusions_and_inclusions_match_instants_across_dst_offsets() {
+        let value = "DTSTART;TZID=Europe/Berlin:20261024T090000\nRRULE:FREQ=DAILY;COUNT=3\nEXDATE:20261025T080000Z\nRDATE;TZID=Asia/Shanghai:20261026T160000,20261027T160000";
+        let result = evaluate(EvaluationRequest {
+            trigger: Trigger::Rrule {
+                value: value.into(),
+            },
+            after: dt("2026-10-24T00:00:00Z"),
+            count: 10,
+        })
+        .unwrap();
+        assert_eq!(
+            result.dates,
+            [
+                dt("2026-10-24T07:00:00Z"),
+                dt("2026-10-26T08:00:00Z"),
+                dt("2026-10-27T08:00:00Z")
+            ]
+        );
+        assert!(result.exhausted);
+    }
     #[test]
     fn once_and_delay_use_strict_cursor_and_checked_arithmetic() {
         let now = dt("2026-09-21T00:00:00Z");

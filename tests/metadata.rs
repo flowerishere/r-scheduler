@@ -401,3 +401,52 @@ async fn selective_metadata_lookup_uses_the_gin_index(pool: PgPool) {
     assert!(plan.to_string().contains("schedules_metadata"), "{plan}");
     assert_eq!(plan[0]["Plan"]["Actual Rows"], 1);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires PostgreSQL; run scripts/test.sh"]
+async fn floating_exception_dates_fail_preview_create_and_replace(pool: PgPool) {
+    let store = Store { pool };
+    let app = app(store.clone());
+    let (_, created) = request(&app, "POST", "/v1/schedules", spec(json!({})), "a", None).await;
+    for property in [
+        "RDATE:20300102T090000",
+        "EXDATE:20300102T090000",
+        "EXDATE;TZID=Asia/Shanghai:20300102T090000Z",
+    ] {
+        let trigger = json!({"type":"rrule", "value":format!("DTSTART;TZID=Asia/Shanghai:20300101T090000\nRRULE:FREQ=DAILY;COUNT=3\n{property}")});
+        let (status, error) = request(
+            &app,
+            "POST",
+            "/v1/preview",
+            json!({"trigger":trigger,"after":"2029-12-01T00:00:00Z"}),
+            "a",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let mut body = spec(json!({}));
+        body["trigger"] = trigger;
+        assert_eq!(
+            request(&app, "POST", "/v1/schedules", body.clone(), "a", None)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                &format!("/v1/schedules/{}", created["id"].as_str().unwrap()),
+                json!({"expected_revision":1,"spec":body}),
+                "a",
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let schedules = store.list_schedules("a", 100, 0).await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(schedules[0].revision, 1);
+}

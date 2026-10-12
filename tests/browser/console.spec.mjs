@@ -531,3 +531,22 @@ test("business metadata can be created, filtered, edited and cleared", async ({p
   await page.getByRole("button", {name: "执行记录", exact: true}).click();
   await expect(page.locator("#metadata-filter")).toBeHidden();
 });
+
+test("RRULE exception dates require a timezone in preview and save", async ({page}) => {
+  await login(page);
+  await page.getByRole("button", {name: "新建计划", exact: true}).click();
+  await page.getByLabel("计划名称", {exact: true}).fill("timezone-exception-example");
+  await page.getByLabel("目标 URL").fill(callback);
+  await page.getByLabel("触发方式").selectOption("rrule");
+  const base = "DTSTART;TZID=Asia/Shanghai:20300101T090000\nRRULE:FREQ=DAILY;COUNT=3";
+  await page.getByLabel("RRULE 规则集").fill(`${base}\nEXDATE:20300102T090000`);
+  await page.getByRole("button", {name: "预览未来 5 次触发"}).click();
+  await expect(page.locator("#preview-result")).toContainText("Floating EXDATE");
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  await expect(page.locator("#editor-error")).toContainText("Floating EXDATE");
+  await page.getByLabel("RRULE 规则集").fill(`${base}\nEXDATE;TZID=Asia/Shanghai:20300102T090000`);
+  await page.getByRole("button", {name: "预览未来 5 次触发"}).click();
+  await expect(page.locator("#preview-result li")).toHaveCount(2);
+  await page.getByRole("button", {name: "创建计划", exact: true}).click();
+  await expect(page.locator("#editor")).toBeHidden();
+});
