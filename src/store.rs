@@ -176,6 +176,8 @@ impl Store {
         {
             return Ok(false);
         }
+        let mut ids = Vec::with_capacity(dates.len());
+        let mut deadlines = Vec::with_capacity(dates.len());
         for date in dates {
             let expires_at = current
                 .spec
@@ -190,13 +192,21 @@ impl Store {
                         })
                 })
                 .transpose()?;
-            sqlx::query("INSERT INTO runs (id,schedule_id,tenant_id,revision,scheduled_at,available_at,status,spec,expires_at,finished_at,last_error)
-                VALUES ($1,$2,$3,$4,$5,$5,CASE WHEN $7::timestamptz <= statement_timestamp() THEN 'dead' ELSE 'pending' END,$6,$7,
-                CASE WHEN $7 <= statement_timestamp() THEN statement_timestamp() END,
-                CASE WHEN $7 <= statement_timestamp() THEN 'Run admission deadline expired' END)
-                ON CONFLICT (schedule_id,revision,scheduled_at) DO NOTHING")
-                .bind(Uuid::new_v4()).bind(current.id).bind(&current.tenant_id).bind(current.revision)
-                .bind(date).bind(&current.spec).bind(expires_at).execute(&mut *tx).await?;
+            ids.push(Uuid::new_v4());
+            deadlines.push(expires_at);
+        }
+        if !dates.is_empty() {
+            // One round trip for the whole catch-up batch. Definition data is
+            // bound once, instead of retransmitting the payload for every run.
+            sqlx::query("INSERT INTO runs (id, schedule_id, tenant_id, revision, scheduled_at, available_at, status, spec, expires_at, finished_at, last_error)
+                SELECT due.id, $2, $3, $4, due.scheduled_at, due.scheduled_at,
+                    CASE WHEN due.expires_at <= statement_timestamp() THEN 'dead' ELSE 'pending' END, $6, due.expires_at,
+                    CASE WHEN due.expires_at <= statement_timestamp() THEN statement_timestamp() END,
+                    CASE WHEN due.expires_at <= statement_timestamp() THEN 'Run admission deadline expired' END
+                FROM UNNEST($1::uuid[], $5::timestamptz[], $7::timestamptz[]) AS due(id, scheduled_at, expires_at)
+                ON CONFLICT (schedule_id, revision, scheduled_at) DO NOTHING")
+                .bind(&ids).bind(current.id).bind(&current.tenant_id).bind(current.revision)
+                .bind(dates).bind(&current.spec).bind(&deadlines).execute(&mut *tx).await?;
         }
         let status = if next.is_some() {
             "active"

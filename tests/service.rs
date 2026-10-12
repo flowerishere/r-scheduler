@@ -4150,3 +4150,318 @@ mod history_tests {
         );
     }
 }
+
+mod maintenance_regression_tests {
+    use chrono::{DateTime, Utc};
+    use scheduler_service::{
+        domain::{
+            ConcurrencyPolicy, DeliveryResult, HttpTarget, MisfirePolicy, RetryPolicy, Schedule,
+            ScheduleSpec, Trigger,
+        },
+        store::{Store, StoreError},
+    };
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::{collections::BTreeMap, time::Duration};
+
+    fn spec(at: DateTime<Utc>) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "test job".into(),
+            trigger: Trigger::Once { at },
+            target: HttpTarget {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: BTreeMap::new(),
+                timeout_seconds: 1,
+            },
+            payload: json!({"order_id": "order-42"}),
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay_seconds: 1,
+                max_delay_seconds: 10,
+                max_age_seconds: None,
+            },
+            misfire: MisfirePolicy::FireOnce,
+            misfire_grace_seconds: 60,
+            concurrency: ConcurrencyPolicy::Allow,
+        }
+    }
+    fn success() -> DeliveryResult {
+        DeliveryResult {
+            success: true,
+            http_status: Some(200),
+            error: None,
+            response_excerpt: Some("ok".into()),
+            retry_after: None,
+        }
+    }
+    async fn create_due(store: &Store) -> Schedule {
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        store
+            .create("tenant-a", spec(at), at, None, "test")
+            .await
+            .unwrap()
+    }
+    async fn create_run(store: &Store) -> Schedule {
+        let schedule = create_due(store).await;
+        assert!(
+            store
+                .materialize(&schedule, &[schedule.next_fire_at.unwrap()], None)
+                .await
+                .unwrap()
+        );
+        schedule
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn lease_recovery_skips_locked_schedules_and_continues(pool: PgPool) {
+        let store = Store { pool };
+        let locked_schedule = create_run(&store).await;
+        let locked_run = store.claim().await.unwrap().unwrap();
+        create_run(&store).await;
+        let other_run = store.claim().await.unwrap().unwrap();
+        sqlx::query("UPDATE runs SET lease_until = clock_timestamp() - INTERVAL '10 seconds' WHERE status = 'running'")
+        .execute(&store.pool).await.unwrap();
+        sqlx::query(
+            "UPDATE runs SET lease_until = lease_until - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(locked_run.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let mut held = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
+            .bind(locked_schedule.id)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        let count = tokio::time::timeout(Duration::from_secs(2), store.recover_expired())
+            .await
+            .expect("one locked schedule must not block recovery of unrelated runs")
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            store
+                .get_run("tenant-a", other_run.id)
+                .await
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            store
+                .get_run("tenant-a", locked_run.id)
+                .await
+                .unwrap()
+                .status,
+            "running"
+        );
+        held.rollback().await.unwrap();
+        assert_eq!(store.recover_expired().await.unwrap(), 1);
+        assert!(!store.finish(&locked_run, success()).await.unwrap());
+        assert_eq!(
+            store.attempts("tenant-a", locked_run.id).await.unwrap()[0].status,
+            "lease_expired"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn lease_recovery_scans_past_a_full_locked_batch(pool: PgPool) {
+        let store = Store { pool };
+        let schedule = create_due(&store).await;
+        let at = schedule.next_fire_at.unwrap();
+        let dates: Vec<_> = (0..101)
+            .map(|i| at - chrono::Duration::seconds(i))
+            .collect();
+        store.materialize(&schedule, &dates, None).await.unwrap();
+        for _ in &dates {
+            store.claim().await.unwrap().unwrap();
+        }
+        create_run(&store).await;
+        let other = store.claim().await.unwrap().unwrap();
+        sqlx::query("UPDATE runs SET lease_until = clock_timestamp() - INTERVAL '10 seconds' WHERE status = 'running'")
+        .execute(&store.pool).await.unwrap();
+        sqlx::query(
+        "UPDATE runs SET lease_until = lease_until - INTERVAL '1 second' WHERE schedule_id = $1",
+    )
+    .bind(schedule.id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+        let mut held = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
+            .bind(schedule.id)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recover_expired().await.unwrap(),
+            1,
+            "locked rows must not consume the 100-item batch"
+        );
+        assert_eq!(
+            store.get_run("tenant-a", other.id).await.unwrap().status,
+            "pending"
+        );
+        held.rollback().await.unwrap();
+        // Independent recovery loops may divide work, but recover each lease once.
+        let (first, second) = tokio::join!(store.recover_expired(), store.recover_expired());
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(first <= 100 && second <= 100);
+        let remainder = store.recover_expired().await.unwrap();
+        assert_eq!(first + second + remainder, 101);
+        assert_eq!(store.recover_expired().await.unwrap(), 0);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn pending_expiry_skips_full_locked_batches(pool: PgPool) {
+        let store = Store { pool };
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(5);
+        let mut job = spec(at);
+        job.retry.max_age_seconds = Some(3600);
+        let locked = store
+            .create("tenant-a", job.clone(), at, None, "test")
+            .await
+            .unwrap();
+        let dates: Vec<_> = (0..101)
+            .map(|i| at - chrono::Duration::seconds(i))
+            .collect();
+        store.materialize(&locked, &dates, None).await.unwrap();
+        store
+            .transition("tenant-a", locked.id, "pause")
+            .await
+            .unwrap();
+        let other = store
+            .create("tenant-a", job, at, None, "test")
+            .await
+            .unwrap();
+        store.materialize(&other, &[at], None).await.unwrap();
+        let protected = create_run(&store).await;
+        sqlx::query("UPDATE runs SET expires_at = clock_timestamp() - INTERVAL '10 seconds' WHERE expires_at IS NOT NULL")
+        .execute(&store.pool).await.unwrap();
+        sqlx::query(
+            "UPDATE runs SET expires_at = expires_at - INTERVAL '1 second' WHERE schedule_id = $1",
+        )
+        .bind(locked.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let mut held = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
+            .bind(locked.id)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        let expired = tokio::time::timeout(Duration::from_secs(2), store.expire_pending())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired, 1, "locked runs must not consume the expiry batch");
+        assert_eq!(
+            store
+                .list_runs("tenant-a", Some(other.id), None, 100, 0)
+                .await
+                .unwrap()[0]
+                .status,
+            "dead"
+        );
+        held.rollback().await.unwrap();
+        let (first, second) = tokio::join!(store.expire_pending(), store.expire_pending());
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(first <= 100 && second <= 100);
+        assert_eq!(first + second + store.expire_pending().await.unwrap(), 101);
+        assert_eq!(store.expire_pending().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .list_runs("tenant-a", Some(protected.id), None, 100, 0)
+                .await
+                .unwrap()[0]
+                .status,
+            "pending"
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL; run scripts/test.sh"]
+    async fn history_cleanup_skips_full_locked_batches(pool: PgPool) {
+        let store = Store { pool };
+        let locked = create_due(&store).await;
+        let at = locked.next_fire_at.unwrap();
+        let dates: Vec<_> = (0..3).map(|i| at - chrono::Duration::seconds(i)).collect();
+        store.materialize(&locked, &dates, None).await.unwrap();
+        for _ in &dates {
+            let run = store.claim().await.unwrap().unwrap();
+            store.finish(&run, success()).await.unwrap();
+        }
+        let other = create_run(&store).await;
+        let other_run = store.claim().await.unwrap().unwrap();
+        store.finish(&other_run, success()).await.unwrap();
+        let protected = create_run(&store).await;
+        sqlx::query("UPDATE runs SET finished_at = clock_timestamp() - INTERVAL '40 days' WHERE status = 'succeeded'")
+        .execute(&store.pool).await.unwrap();
+        sqlx::query(
+            "UPDATE runs SET finished_at = finished_at - INTERVAL '1 day' WHERE schedule_id = $1",
+        )
+        .bind(locked.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let cutoff = store.now().await.unwrap() - chrono::Duration::days(30);
+        let mut held = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
+            .bind(locked.id)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        let preview = store.cleanup_history(cutoff, 2, false).await.unwrap();
+        assert_eq!(preview.eligible_runs, 4);
+        assert_eq!(preview.deleted_runs, 0);
+        let report = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.cleanup_history(cutoff, 2, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            report.deleted_runs, 1,
+            "locked runs must not consume the cleanup batch"
+        );
+        assert_eq!(report.deleted_attempts, 1);
+        assert!(matches!(
+            store.get_run("tenant-a", other_run.id).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(store.get_schedule("tenant-a", other.id).await.is_ok());
+        held.rollback().await.unwrap();
+        let (first, second) = tokio::join!(
+            store.cleanup_history(cutoff, 2, true),
+            store.cleanup_history(cutoff, 2, true)
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(first.deleted_runs <= 2 && second.deleted_runs <= 2);
+        let remainder = store.cleanup_history(cutoff, 2, true).await.unwrap();
+        assert_eq!(
+            first.deleted_runs + second.deleted_runs + remainder.deleted_runs,
+            3
+        );
+        assert_eq!(
+            first.deleted_attempts + second.deleted_attempts + remainder.deleted_attempts,
+            3
+        );
+        assert_eq!(
+            store
+                .cleanup_history(cutoff, 2, true)
+                .await
+                .unwrap()
+                .eligible_runs,
+            0
+        );
+        assert_eq!(
+            store
+                .list_runs("tenant-a", Some(protected.id), None, 100, 0)
+                .await
+                .unwrap()[0]
+                .status,
+            "pending"
+        );
+    }
+}

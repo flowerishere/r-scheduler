@@ -502,3 +502,118 @@ async fn tenant_cli_provisions_limits_before_first_schedule_and_validates_input(
         Some(2)
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires PostgreSQL; run scripts/test.sh"]
+async fn locked_schedules_do_not_starve_later_tenants_or_consume_tokens(pool: PgPool) {
+    let store = Store { pool };
+    let now = store.now().await.unwrap() - chrono::Duration::minutes(1);
+    let mut blocked = Vec::new();
+    for i in 0..10 {
+        let name = format!("a{i:02}");
+        let schedule = batch(&store, &name, 1, now).await;
+        store
+            .set_tenant_limits(
+                &name,
+                &TenantLimits {
+                    rate_per_second: Some(1),
+                    burst: 1,
+                    ..TenantLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        blocked.push(schedule.id);
+    }
+    batch(&store, "z", 1, now).await;
+    let mut held = store.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM schedules WHERE id = ANY($1) FOR UPDATE")
+        .bind(&blocked)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let run = tokio::time::timeout(Duration::from_secs(2), async {
+        for _ in 0..3 {
+            if let Some(run) = store.claim().await.unwrap() {
+                return run;
+            }
+        }
+        panic!("blocked turns must advance so later tenants can run");
+    })
+    .await
+    .unwrap();
+    assert_eq!(run.tenant_id, "z");
+    let balances: Vec<f64> =
+        sqlx::query_scalar("SELECT tokens FROM tenant_dispatch WHERE tenant_id <> 'z'")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert!(balances.iter().all(|n| *n == 1.0));
+    held.rollback().await.unwrap();
+    assert!(store.claim().await.unwrap().is_some());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires PostgreSQL; run scripts/test.sh"]
+async fn bulk_materialization_keeps_per_run_deadlines_and_rolls_back_on_overflow(pool: PgPool) {
+    let store = Store { pool };
+    let now = store.now().await.unwrap();
+    let first = now - chrono::Duration::minutes(2);
+    let spec: ScheduleSpec = serde_json::from_value(json!({
+        "name":"batch expiry", "trigger":{"type":"once","at":first},
+        "target":{"url":"http://127.0.0.1:9/hook"}, "retry":{"max_age_seconds":30}
+    }))
+    .unwrap();
+    let schedule = store
+        .create("a", spec.clone(), first, None, "test")
+        .await
+        .unwrap();
+    let recent = now - chrono::Duration::seconds(5);
+    assert!(
+        store
+            .materialize(&schedule, &[first, recent, recent], None)
+            .await
+            .unwrap()
+    );
+    let runs = store
+        .list_runs("a", Some(schedule.id), None, 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    for run in runs {
+        assert_eq!(
+            run.expires_at,
+            Some(run.scheduled_at + chrono::Duration::seconds(30))
+        );
+        assert_eq!(
+            run.status,
+            if run.scheduled_at == first {
+                "dead"
+            } else {
+                "pending"
+            }
+        );
+    }
+    let another = store.create("a", spec, first, None, "test").await.unwrap();
+    assert!(
+        store
+            .materialize(&another, &[recent, DateTime::<Utc>::MAX_UTC], None)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .list_runs("a", Some(another.id), None, 100, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_schedule("a", another.id)
+            .await
+            .unwrap()
+            .next_fire_at,
+        Some(first)
+    );
+}
