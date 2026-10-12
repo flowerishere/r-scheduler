@@ -14,6 +14,7 @@ use url::{Host, Url};
 use crate::domain::{DeliveryResult, HttpTarget, RetryAfter, Run, ScheduleSpec, Trigger};
 
 pub fn validate_spec(spec: &ScheduleSpec) -> anyhow::Result<()> {
+    crate::metadata::validate(&spec.metadata)?;
     if let Trigger::Once { at } = spec.trigger {
         crate::trigger::validate_once(at)?;
     }

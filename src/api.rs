@@ -393,6 +393,7 @@ struct ScheduleQuery {
     offset: i64,
     status: Option<String>,
     q: Option<String>,
+    metadata: Option<String>,
 }
 fn page_size() -> i64 {
     50
@@ -444,6 +445,12 @@ async fn list_schedules(
             "q must contain at most 200 bytes without control characters",
         ));
     }
+    let metadata = query
+        .metadata
+        .as_deref()
+        .map(crate::metadata::parse_filter)
+        .transpose()
+        .map_err(ApiError::bad)?;
     Ok(Json(
         state
             .store
@@ -452,6 +459,7 @@ async fn list_schedules(
                 crate::store::ScheduleFilter {
                     status: query.status.as_deref(),
                     query: query.q.as_deref().map(str::trim),
+                    metadata: metadata.as_ref(),
                 },
                 query.limit,
                 query.offset,

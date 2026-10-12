@@ -123,16 +123,22 @@ def main():
         })
         assert preview["dates"] == ["2026-09-30T01:00:00Z", "2026-11-30T01:00:00Z", "2026-12-31T01:00:00Z"]
         job = {"name": "container smoke", "trigger": {"type": "delay", "seconds": 1},
+               "metadata": {"order_id": "smoke-42", "env": "container"},
                "target": {"url": f"http://host.docker.internal:{receiver.server_port}/hook"},
                "retry": {"max_attempts": 3, "initial_delay_seconds": 1,
                          "max_delay_seconds": 5, "max_age_seconds": 120}}
         created = api("/v1/schedules", job, idempotency="smoke-job")
         assert api("/v1/schedules", job, idempotency="smoke-job")["id"] == created["id"]
+        metadata_query = "/v1/schedules?" + urllib.parse.urlencode({"metadata": json.dumps(job["metadata"])})
+        assert [row["id"] for row in api(metadata_query)] == [created["id"]]
+        assert api(metadata_query, key="smoke-tenant-b-api-key") == []
+
         def finished(schedule_id, status):
             runs = api(f"/v1/runs?schedule_id={schedule_id}")
             return runs[0] if runs and runs[0]["status"] == status else None
 
         run = eventually(lambda: finished(created["id"], "succeeded"))
+        assert run["spec"]["metadata"] == job["metadata"]
         attempts = api(f"/v1/runs/{run['id']}/attempts")
         assert [a["http_status"] for a in attempts] == [503, 200]
         with lock:
@@ -159,7 +165,7 @@ def main():
         docker("stop", "--time", "10", service)
         state = json.loads(docker("inspect", service).stdout)[0]["State"]
         assert state["ExitCode"] == 0, state
-        print("PASS: image startup, migration, RRULE preview, delayed callback, Retry-After, expired run, cleanup preview, tenant metrics, embedded console, tenant capacity and administrator limits, stable idempotency key, graceful shutdown")
+        print("PASS: image startup, migration, embedded console, tenant identity/capacity, administrator limits, metadata filters/snapshot/isolation, RRULE, delayed delivery, Retry-After, idempotency, tenant metrics, expired run, cleanup preview, graceful shutdown")
     except BaseException:
         if service in owned_containers:
             logs = docker("logs", "--tail", "80", service, check=False)

@@ -72,7 +72,7 @@ async fn migrate_command_and_store_apply_initial_schema_idempotently(pool: sqlx:
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions, [1, 2, 3]);
+    assert_eq!(versions, [1, 2, 3, 4]);
     let store = Store::connect(&url).await.unwrap();
     let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
         .fetch_one(&store.pool)
@@ -1638,6 +1638,7 @@ mod runtime_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     fn success() -> DeliveryResult {
@@ -1999,6 +2000,7 @@ mod lifecycle_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     fn success() -> DeliveryResult {
@@ -2339,6 +2341,7 @@ mod expiry_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     fn success() -> DeliveryResult {
@@ -2600,7 +2603,7 @@ mod expiry_tests {
         let schedule = create_due(&store).await;
         let run_id = Uuid::new_v4();
         sqlx::query("INSERT INTO runs (id, schedule_id, tenant_id, revision, scheduled_at, available_at, status, spec) VALUES ($1, $2, 'tenant-a', 1, $3, $3, 'pending', $4)")
-        .bind(run_id).bind(schedule.id).bind(schedule.next_fire_at).bind(&schedule.spec).execute(&store.pool).await.unwrap();
+            .bind(run_id).bind(schedule.id).bind(schedule.next_fire_at).bind(&schedule.spec).execute(&store.pool).await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/0002_operations.sql"))
             .execute(&store.pool)
             .await
@@ -2609,6 +2612,19 @@ mod expiry_tests {
             .execute(&store.pool)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0004_schedule_metadata.sql"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_schedule("tenant-a", schedule.id)
+                .await
+                .unwrap()
+                .spec
+                .metadata
+                .is_empty()
+        );
         assert_eq!(
             store.list_schedules("tenant-a", 10, 0).await.unwrap().len(),
             1
@@ -2758,6 +2774,7 @@ mod cleanup_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     fn success() -> DeliveryResult {
@@ -3066,6 +3083,7 @@ mod metrics_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     fn success() -> DeliveryResult {
@@ -3252,6 +3270,7 @@ mod console_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     async fn request(
@@ -3479,6 +3498,7 @@ mod recurrence_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     async fn create_due(store: &Store) -> Schedule {
@@ -3989,6 +4009,7 @@ mod history_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     async fn create_due(store: &Store) -> Schedule {
@@ -4183,6 +4204,7 @@ mod maintenance_regression_tests {
             misfire: MisfirePolicy::FireOnce,
             misfire_grace_seconds: 60,
             concurrency: ConcurrencyPolicy::Allow,
+            metadata: Default::default(),
         }
     }
     fn success() -> DeliveryResult {

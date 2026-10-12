@@ -16,5 +16,9 @@
     "max_attempts": 5,
     "initial_delay_seconds": 1,
     "max_delay_seconds": 30
+  },
+  "metadata": {
+    "order_id": "order-42",
+    "env": "demo"
   }
 }

@@ -93,6 +93,9 @@ pub struct ScheduleSpec {
     pub misfire_grace_seconds: u32,
     #[serde(default)]
     pub concurrency: ConcurrencyPolicy,
+    // Omit empty metadata to preserve hashes of pre-0.5 idempotent requests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 fn default_grace() -> u32 {

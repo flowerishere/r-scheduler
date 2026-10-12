@@ -109,6 +109,7 @@ function configureView() {
   $("page-description").textContent = schedules ? "安排下一次执行，掌握每一个周期。" : "查看每次投递的结果，定位错误并追踪重试。";
   $("list-title").textContent = schedules ? "全部计划" : "执行历史";
   $("search-field").hidden = !schedules; $("run-schedule-field").hidden = schedules;
+  $("metadata-filter").hidden = !schedules;
   $("status-filter").replaceChildren(new Option("全部状态", ""), ...(schedules ? ["active", "paused", "completed", "error", "cancelled"] : ["pending", "running", "succeeded", "dead", "cancelled"]).map((s) => new Option(statuses[s], s)));
   for (const button of document.querySelectorAll("[data-view]")) {
     const active = button.dataset.view === state.view;
@@ -134,12 +135,18 @@ function applyFilters() {
   state.filters = {status: $("status-filter").value};
   if (state.view === "schedules") {
     state.filters.q = $("search").value.trim();
+    // Computed keys preserve literal dots, brackets and __proto__ as data.
+    if ($("metadata-key").value) state.filters.metadata = JSON.stringify({[$("metadata-key").value]: $("metadata-value").value});
   }
   else state.filters.schedule_id = $("run-schedule-id").value.trim();
   state.offset = 0;
 }
 $("filters").addEventListener("submit", (event) => {
   event.preventDefault();
+  if (state.view === "schedules" && $("metadata-value").value && !$("metadata-key").value) {
+    $("metadata-filter").open = true; $("metadata-key").focus();
+    showError("list-error", "填写元数据值时，需要同时填写元数据键。"); return;
+  }
   applyFilters(); void refresh();
 });
 $("clear-filters").addEventListener("click", () => { $("filters").reset(); applyFilters(); void refresh(); });
@@ -242,6 +249,7 @@ function openEditor(schedule = null) {
     if (spec.trigger.type === "rrule") $("rrule-value").value = spec.trigger.value;
     $("target-url").value = spec.target.url; $("target-headers").value = JSON.stringify(spec.target.headers, null, 2);
     $("payload").value = stringifyExactJson(spec.payload, 2); $("timeout-seconds").value = spec.target.timeout_seconds;
+    $("metadata").value = JSON.stringify(spec.metadata ?? {}, null, 2);
     $("max-attempts").value = spec.retry.max_attempts; $("initial-delay").value = spec.retry.initial_delay_seconds;
     $("max-delay").value = spec.retry.max_delay_seconds; $("max-age").value = spec.retry.max_age_seconds ?? "";
     $("misfire").value = spec.misfire; $("misfire-grace").value = spec.misfire_grace_seconds; $("concurrency").value = spec.concurrency;
@@ -289,9 +297,11 @@ function parseJson(id, label) {
 function readSpec() {
   const headers = parseJson("target-headers", "请求头");
   if (!headers || Array.isArray(headers) || typeof headers !== "object" || Object.values(headers).some((value) => typeof value !== "string")) throw new Error("请求头必须是值为字符串的 JSON 对象。");
+  const metadata = parseJson("metadata", "业务元数据");
+  if (!metadata || Array.isArray(metadata) || typeof metadata !== "object" || Object.values(metadata).some((value) => typeof value !== "string")) throw new Error("业务元数据必须是值为字符串的 JSON 对象。");
   const retry = {max_attempts: integer("max-attempts"), initial_delay_seconds: integer("initial-delay"), max_delay_seconds: integer("max-delay")};
   if ($("max-age").value) retry.max_age_seconds = integer("max-age");
-  return {name: $("job-name").value.trim(), trigger: readTrigger(), target: {url: $("target-url").value.trim(), headers, timeout_seconds: integer("timeout-seconds")}, payload: parseJson("payload", "Payload"), retry, misfire: $("misfire").value, misfire_grace_seconds: integer("misfire-grace"), concurrency: $("concurrency").value};
+  return {name: $("job-name").value.trim(), trigger: readTrigger(), target: {url: $("target-url").value.trim(), headers, timeout_seconds: integer("timeout-seconds")}, payload: parseJson("payload", "Payload"), metadata, retry, misfire: $("misfire").value, misfire_grace_seconds: integer("misfire-grace"), concurrency: $("concurrency").value};
 }
 $("preview-trigger").addEventListener("click", async () => {
   const editor = state.editor, previewId = ++state.preview;
@@ -326,7 +336,8 @@ $("schedule-form").addEventListener("submit", async (event) => {
     toast(editing ? "计划已更新" : "计划已创建");
     if (editor === state.editor) {
       $("editor").close();
-      await switchView("schedules");
+      if (editing && state.view === "schedules") await refresh();
+      else await switchView("schedules");
     }
     else await refresh(true);
   } catch (error) {

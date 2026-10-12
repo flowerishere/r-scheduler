@@ -590,6 +590,16 @@ impl Store {
                 .push_bind(query)
                 .push(")");
         }
+        if let Some(metadata) = filter.metadata {
+            crate::metadata::validate(metadata)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+            // Empty filters also match legacy schedules without a metadata key.
+            // Keep a direct @> predicate so generic plans can use the GIN index.
+            if !metadata.is_empty() {
+                sql.push(" AND (spec -> 'metadata') @> ")
+                    .push_bind(Json(metadata));
+            }
+        }
         sql.push(" ORDER BY created_at DESC, id DESC LIMIT ")
             .push_bind(limit.clamp(1, 100))
             .push(" OFFSET ")
@@ -646,4 +656,5 @@ struct MetricsSnapshot {
 pub struct ScheduleFilter<'a> {
     pub status: Option<&'a str>,
     pub query: Option<&'a str>,
+    pub metadata: Option<&'a crate::metadata::Metadata>,
 }

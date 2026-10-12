@@ -57,6 +57,7 @@
             <label id="run-schedule-field" hidden>计划 ID<input id="run-schedule-id" placeholder="按计划 ID 筛选" spellcheck="false"></label>
             <label class="filter-status"><span class="sr-only">状态筛选</span><select id="status-filter" aria-label="状态筛选"></select></label>
             <button class="secondary" type="submit">筛选</button><button id="clear-filters" class="text-button" type="button">清除</button>
+            <details id="metadata-filter" class="metadata-filter"><summary>按业务元数据筛选</summary><div class="form-grid"><label>元数据键<input id="metadata-key" placeholder="例如 order_id" maxlength="64" spellcheck="false"></label><label>元数据值<input id="metadata-value" placeholder="精确匹配，可为空" maxlength="512" spellcheck="false"></label></div><p class="field-help">键和值区分大小写；填写后点击「筛选」。</p></details>
           </form>
           <p id="list-error" class="error panel-message" role="alert" hidden></p>
           <div id="loading" class="empty-state" role="status" hidden>正在读取工作空间…</div>
@@ -82,6 +83,7 @@
         <div class="section-label">HTTP 投递</div>
         <label for="target-url">目标 URL</label><input id="target-url" type="url" required placeholder="https://your-service.example/hooks/task">
         <label for="payload">Payload（JSON）</label><textarea id="payload" class="code-input" rows="4" spellcheck="false">{}</textarea>
+        <label for="metadata">业务元数据（JSON 对象，可选）</label><textarea id="metadata" class="code-input" rows="2" spellcheck="false">{}</textarea><p class="field-help">用于关联订单、环境或业务类型，可按键值筛选。最多 32 个字符串键值对；不会自动加入 Payload。</p>
         <details id="advanced"><summary>重试、并发与更多选项</summary>
           <div class="form-grid"><label>请求超时（秒）<input id="timeout-seconds" type="number" min="1" max="300" value="30" required></label><label>最大尝试次数<input id="max-attempts" type="number" min="1" max="100" value="5" required></label><label>初始退避（秒）<input id="initial-delay" type="number" min="1" max="86400" value="5" required></label><label>最大退避（秒）<input id="max-delay" type="number" min="1" max="86400" value="3600" required></label><label>有效期（秒，可选）<input id="max-age" type="number" min="1" max="31536000" placeholder="不限制"></label><label>漏调度宽限（秒）<input id="misfire-grace" type="number" min="0" max="86400" value="60" required></label><label>漏调度策略<select id="misfire"><option value="fire_once">合并为一次</option><option value="skip">超过宽限后跳过</option><option value="catch_up">逐次补偿</option></select></label><label>同一计划的并发<select id="concurrency"><option value="allow">允许并行</option><option value="forbid">串行排队</option></select></label></div>
           <p class="field-help">有效期从原计划时间计算；到期后不再认领，已开始的请求允许完成。</p>
