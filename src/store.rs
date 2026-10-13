@@ -486,7 +486,8 @@ impl Store {
             "WITH ready AS (
                 SELECT r.available_at FROM runs r JOIN schedules s ON s.id = r.schedule_id
                 WHERE r.tenant_id = $1 AND r.status = 'pending' AND r.available_at <= statement_timestamp()
-                AND (r.expires_at IS NULL OR r.expires_at > statement_timestamp()) AND s.status NOT IN ('paused', 'cancelled')
+                AND (r.expires_at IS NULL OR r.expires_at > statement_timestamp())
+                AND s.status IN ('active', 'completed') AND r.revision = s.revision
             ) SELECT
                 (SELECT COALESCE(jsonb_object_agg(status, n), '{}'::jsonb) FROM (SELECT status, COUNT(*) n FROM schedules WHERE tenant_id = $1 GROUP BY status) c) AS schedules,
                 (SELECT COALESCE(jsonb_object_agg(status, n), '{}'::jsonb) FROM (SELECT status, COUNT(*) n FROM runs WHERE tenant_id = $1 GROUP BY status) c) AS runs,
@@ -524,7 +525,7 @@ impl Store {
         for (name, help, value) in [
             (
                 "scheduler_ready_runs",
-                "Due unexpired pending runs on unpaused schedules, including concurrency-blocked work.",
+                "Due unexpired pending runs for current revisions of active or completed schedules, including quota- or concurrency-blocked work.",
                 ready as f64,
             ),
             (

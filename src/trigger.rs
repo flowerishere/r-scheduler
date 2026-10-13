@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::domain::Trigger;
 
 pub const MAX_PREVIEW: usize = 256;
+const MAX_RRULE_BYTES: usize = 16 * 1024;
+// JSON may expand a control character into six bytes. Leave room for the
+// complete escaped rule plus the cursor, count and request structure.
+pub const MAX_EVALUATION_INPUT_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -25,7 +29,41 @@ pub struct Evaluation {
     pub exhausted: bool,
 }
 
+/// Cheap bounds are checked before acquiring a subprocess slot as well as in
+/// the child. Invalid user input must not appear to be an IPC failure.
+pub fn validate_request(request: &EvaluationRequest) -> anyhow::Result<()> {
+    if !(1..=MAX_PREVIEW).contains(&request.count) {
+        bail!("count must be 1..={MAX_PREVIEW}");
+    }
+    match &request.trigger {
+        Trigger::Once { at } => validate_once(*at)?,
+        Trigger::Delay { .. } => bail!("Delay must be resolved to an absolute timestamp first"),
+        Trigger::Cron {
+            expression,
+            timezone,
+        } => {
+            if expression.len() > 512 || !matches!(expression.split_whitespace().count(), 5 | 6) {
+                bail!("Cron requires five fields, or six fields with seconds first");
+            }
+            if timezone.len() > 128 {
+                bail!("IANA timezone name exceeds 128 bytes");
+            }
+        }
+        Trigger::Rrule { value } if value.len() > MAX_RRULE_BYTES => {
+            bail!("RRULE input exceeds 16 KiB");
+        }
+        Trigger::Rrule { .. } => (),
+    }
+    Ok(())
+}
+
 pub fn validate_once(at: DateTime<Utc>) -> anyhow::Result<()> {
+    // PostgreSQL starts at Julian day zero; Chrono accepts earlier dates that
+    // would otherwise fail only during INSERT.
+    let minimum = DateTime::from_timestamp(-210_866_803_200, 0).unwrap();
+    if at < minimum {
+        bail!("Timestamp precedes PostgreSQL's minimum (-4713-11-24T00:00:00Z)");
+    }
     if at.timestamp_subsec_nanos() >= 1_000_000_000 {
         bail!("Leap-second timestamps are not supported");
     }
@@ -37,27 +75,82 @@ pub fn validate_once(at: DateTime<Utc>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn normalize_rrule(value: &str) -> anyhow::Result<String> {
+    let mut normalized = String::with_capacity(value.len());
+    let mut starts = 0;
+    for line in value.lines() {
+        let line = line.trim();
+        // Preserve bare FREQ=... rules. Explicit names must be recognized:
+        // upstream treats unknown lowercase names (even exrule) as RRULE.
+        let (property, dates) = line.split_once(':').unwrap_or(("RRULE", line));
+        let mut parts = property.split(';');
+        let name = parts.next().unwrap_or_default().to_ascii_uppercase();
+        match name.as_str() {
+            "EXRULE" => bail!("EXRULE is not supported; use explicit EXDATE values"),
+            "DTSTART" => starts += 1,
+            "RRULE" | "RDATE" | "EXDATE" => (),
+            _ => bail!("Unsupported calendar property: {name}"),
+        }
+        normalized.push_str(&name);
+        let mut has_timezone = false;
+        for parameter in parts {
+            if name == "RRULE" {
+                bail!("RRULE property parameters are not supported");
+            }
+            let (key, value) = parameter
+                .split_once('=')
+                .context("Invalid calendar property parameter")?;
+            let key = key.to_ascii_uppercase();
+            match key.as_str() {
+                "TZID" => has_timezone = true,
+                "VALUE" if value.eq_ignore_ascii_case("DATE-TIME") => (),
+                "VALUE" => bail!("{name} only supports VALUE=DATE-TIME"),
+                _ => bail!("Unsupported calendar property parameter: {key}"),
+            }
+            normalized.push(';');
+            normalized.push_str(&key);
+            normalized.push('=');
+            // Timezone identifiers are case-sensitive; preserve their values.
+            normalized.push_str(if key == "VALUE" { "DATE-TIME" } else { value });
+        }
+        if name != "RRULE" {
+            for date in dates.split(',') {
+                if !date.contains('T') {
+                    bail!("All-day {name} is not supported; specify DATE-TIME values");
+                }
+                // Floating exceptions use the host timezone upstream; adding
+                // Z to TZID silently discards the supplied timezone.
+                if !date.ends_with('Z') && !has_timezone {
+                    bail!("Floating {name} is not supported; specify UTC Z or TZID");
+                }
+                if date.ends_with('Z') && has_timezone {
+                    bail!("{name} must use either UTC Z or TZID, not both");
+                }
+            }
+        }
+        normalized.push(':');
+        normalized.push_str(dates);
+        normalized.push('\n');
+    }
+    if starts != 1 {
+        bail!("RRULE requires exactly one DTSTART with UTC Z or an explicit TZID");
+    }
+    Ok(normalized)
+}
+
 /// Runs in a disposable child process: arbitrary calendar rules get a hard wall-clock budget.
 pub fn evaluate(request: EvaluationRequest) -> anyhow::Result<Evaluation> {
-    if !(1..=MAX_PREVIEW).contains(&request.count) {
-        bail!("count must be 1..={MAX_PREVIEW}");
-    }
+    validate_request(&request)?;
     match request.trigger {
-        Trigger::Once { at } => {
-            validate_once(at)?;
-            Ok(Evaluation {
-                dates: if at > request.after { vec![at] } else { vec![] },
-                exhausted: true,
-            })
-        }
+        Trigger::Once { at } => Ok(Evaluation {
+            dates: if at > request.after { vec![at] } else { vec![] },
+            exhausted: true,
+        }),
         Trigger::Delay { .. } => bail!("Delay must be resolved to an absolute timestamp first"),
         Trigger::Cron {
             expression,
             timezone,
         } => {
-            if expression.len() > 512 || !matches!(expression.split_whitespace().count(), 5 | 6) {
-                bail!("Cron requires five fields, or six fields with seconds first");
-            }
             let tz = Tz::from_str(&timezone).context("Invalid IANA timezone")?;
             let cron = Cron::from_str(&expression).context("Invalid Cron expression")?;
             let mut dates = Vec::with_capacity(request.count);
@@ -78,48 +171,7 @@ pub fn evaluate(request: EvaluationRequest) -> anyhow::Result<Evaluation> {
             })
         }
         Trigger::Rrule { value } => {
-            if value.len() > 16_384 {
-                bail!("RRULE input exceeds 16 KiB");
-            }
-            for (property, dates) in value.lines().filter_map(|line| line.trim().split_once(':')) {
-                let name = property.split(';').next().unwrap_or_default();
-                // rrule silently ignores EXRULE unless its optional feature is
-                // enabled. Reject it instead of scheduling excluded occurrences.
-                if name == "EXRULE" {
-                    bail!("EXRULE is not supported; use explicit EXDATE values");
-                }
-                if matches!(name, "DTSTART" | "RDATE" | "EXDATE") {
-                    if property
-                        .split(';')
-                        .any(|parameter| parameter == "VALUE=DATE")
-                        || dates.split(',').any(|date| !date.contains('T'))
-                    {
-                        bail!("All-day {name} is not supported; specify DATE-TIME values");
-                    }
-                    let has_timezone = property
-                        .split(';')
-                        .any(|parameter| parameter.starts_with("TZID="));
-                    for date in dates.split(',') {
-                        // Upstream uses the machine timezone for floating RDATE
-                        // and EXDATE; it does not inherit DTSTART's timezone.
-                        if !date.ends_with('Z') && !has_timezone {
-                            bail!("Floating {name} is not supported; specify UTC Z or TZID");
-                        }
-                        // Upstream silently ignores TZID when Z is present.
-                        if date.ends_with('Z') && has_timezone {
-                            bail!("{name} must use either UTC Z or TZID, not both");
-                        }
-                    }
-                }
-            }
-            let starts: Vec<_> = value
-                .lines()
-                .filter_map(|line| line.trim().split_once(':'))
-                .filter(|(property, _)| property.split(';').next() == Some("DTSTART"))
-                .collect();
-            if starts.len() != 1 {
-                bail!("RRULE requires exactly one DTSTART with UTC Z or an explicit TZID");
-            }
+            let value = normalize_rrule(&value)?;
             let rules = RRuleSet::from_str(&value).context("Invalid RRULE set")?;
             if rules.get_rrule().len() > 4 {
                 bail!("At most four RRULE lines are supported");

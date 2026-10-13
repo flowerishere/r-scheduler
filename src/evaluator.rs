@@ -6,7 +6,9 @@ use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore};
 
 use crate::{
     domain::Trigger,
-    trigger::{Evaluation, EvaluationRequest, evaluate},
+    trigger::{
+        Evaluation, EvaluationRequest, MAX_EVALUATION_INPUT_BYTES, evaluate, validate_request,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -44,13 +46,17 @@ impl Evaluator {
             after,
             count,
         };
+        validate_request(&request)?;
         if matches!(trigger, Trigger::Once { .. }) {
             return evaluate(request);
+        }
+        let input = serde_json::to_vec(&request)?;
+        if input.len() > MAX_EVALUATION_INPUT_BYTES {
+            bail!("Rule evaluation request exceeds 128 KiB");
         }
         let _permit = tokio::time::timeout(self.timeout, self.permits.acquire())
             .await
             .map_err(|_| EvaluatorBusy)??;
-        let input = serde_json::to_vec(&request)?;
         let operation = async {
             let mut child = Command::new(&self.executable)
                 .arg("evaluate")

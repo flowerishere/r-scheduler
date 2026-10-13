@@ -325,11 +325,14 @@ async fn create(
     headers: HeaderMap,
     Json(mut spec): Json<ScheduleSpec>,
 ) -> Result<(StatusCode, Json<Schedule>)> {
-    let key = headers
-        .get("idempotency-key")
-        .map(|h| h.to_str())
-        .transpose()
-        .map_err(ApiError::bad)?;
+    let mut keys = headers.get_all("idempotency-key").iter();
+    let key = keys.next();
+    if keys.next().is_some() {
+        return Err(ApiError::bad(
+            "Exactly one Idempotency-Key header is allowed",
+        ));
+    }
+    let key = key.map(|h| h.to_str()).transpose().map_err(ApiError::bad)?;
     if key.is_some_and(|key| key.is_empty() || key.len() > 200) {
         return Err(ApiError::bad("Idempotency-Key must contain 1..200 bytes"));
     }

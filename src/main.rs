@@ -18,9 +18,7 @@ use tracing_subscriber::EnvFilter;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if matches!(cli.command, Command::Evaluate) {
-        let request = serde_json::from_reader(std::io::stdin().lock().take(32 * 1024));
-        let result = request
-            .map_err(anyhow::Error::from)
+        let result = read_evaluation_request(std::io::stdin().lock())
             .and_then(trigger::evaluate)
             .map_err(|error| format!("{error:#}"));
         serde_json::to_writer(std::io::stdout().lock(), &result)?;
@@ -38,6 +36,17 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(run(cli))
+}
+
+fn read_evaluation_request(input: impl Read) -> anyhow::Result<trigger::EvaluationRequest> {
+    let mut bytes = Vec::new();
+    input
+        .take((trigger::MAX_EVALUATION_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > trigger::MAX_EVALUATION_INPUT_BYTES {
+        anyhow::bail!("Rule evaluation request exceeds 128 KiB");
+    }
+    serde_json::from_slice(&bytes).context("Invalid rule evaluation request")
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -148,23 +157,35 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     tracing::info!(?role, workers = config.workers, "Scheduler service started");
-    let early_exit = tokio::select! {
-        result = tasks.join_next() => Some(result),
-        result = shutdown_signal() => { result?; None },
+    let stop_result = tokio::select! {
+        result = tasks.join_next() => match result {
+            Some(Ok(Err(error))) => Err(error),
+            Some(Err(error)) => Err(error.into()),
+            _ => Err(anyhow::anyhow!("A service task exited unexpectedly")),
+        },
+        result = shutdown_signal() => result,
     };
     shutdown.cancel();
     tracing::info!("Draining active requests and deliveries");
-    while let Some(result) = tasks.join_next().await {
-        result??;
-    }
+    let drain_result = drain_tasks(&mut tasks).await;
     store.pool.close().await;
-    if let Some(result) = early_exit {
-        if let Some(result) = result {
-            result??;
+    stop_result?;
+    drain_result
+}
+
+async fn drain_tasks(tasks: &mut JoinSet<anyhow::Result<()>>) -> anyhow::Result<()> {
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        let result = result
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        anyhow::bail!("A service task exited unexpectedly");
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {
@@ -177,4 +198,44 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    async fn check_drain(panic: bool) {
+        let finished = Arc::new(AtomicBool::new(false));
+        let delivered = finished.clone();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            delivered.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        tasks.spawn(async move {
+            assert!(!panic, "simulated service task panic");
+            anyhow::bail!("simulated service task error")
+        });
+        assert!(drain_tasks(&mut tasks).await.is_err());
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "in-flight delivery was aborted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_deliveries_after_a_task_error() {
+        check_drain(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_deliveries_after_a_task_panic() {
+        check_drain(true).await;
+    }
 }
