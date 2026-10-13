@@ -1,6 +1,8 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    collections::HashSet,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     str::FromStr,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -9,9 +11,28 @@ use reqwest::{
     Client,
     header::{HeaderName, HeaderValue},
 };
+use tokio::sync::Semaphore;
 use url::{Host, Url};
 
 use crate::domain::{DeliveryResult, HttpTarget, RetryAfter, Run, ScheduleSpec, Trigger};
+
+static DNS_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
+
+async fn resolve_with(
+    permits: Arc<Semaphore>,
+    lookup: impl FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let permit = permits.acquire_owned().await?;
+    tokio::task::spawn_blocking(move || {
+        // Blocking OS resolution continues after its async caller times out.
+        // Keep its slot until the actual job ends, including queued jobs.
+        let _permit = permit;
+        lookup()
+    })
+    .await
+    .context("Join target host resolver")?
+    .context("Resolve target host")
+}
 
 pub fn validate_spec(spec: &ScheduleSpec) -> anyhow::Result<()> {
     crate::metadata::validate(&spec.metadata)?;
@@ -76,8 +97,12 @@ pub fn validate_target(target: &HttpTarget) -> anyhow::Result<Url> {
     if target.headers.len() > 16 {
         bail!("At most 16 target headers are allowed");
     }
+    let mut names = HashSet::with_capacity(target.headers.len());
     for (name, value) in &target.headers {
         let name = HeaderName::from_str(name).context("Invalid target header name")?;
+        if !names.insert(name.clone()) {
+            bail!("Duplicate target header: {name} (header names are case-insensitive)");
+        }
         if name.as_str().starts_with("x-scheduler-")
             || matches!(
                 name.as_str(),
@@ -167,10 +192,9 @@ pub async fn deliver(run: &Run, allow_private: bool) -> DeliveryResult {
     // diagnostic body is interrupted. Both phases share one total deadline.
     let mut excerpt = Vec::new();
     let read_body = async {
-        while excerpt.len() < 4096 {
-            let Some(chunk) = response.chunk().await? else {
-                break;
-            };
+        // Bound retained diagnostics, but consume the complete HTTP message.
+        // A truncated or stalled tail must not turn a 2xx response into success.
+        while let Some(chunk) = response.chunk().await? {
             let count = chunk.len().min(4096 - excerpt.len());
             excerpt.extend_from_slice(&chunk[..count]);
         }
@@ -195,14 +219,17 @@ async fn send(run: &Run, allow_private: bool) -> anyhow::Result<reqwest::Respons
     let url = validate_target(target)?;
     let port = url.port_or_known_default().context("Missing target port")?;
     let (host, addresses): (String, Vec<SocketAddr>) = match url.host().context("Missing host")? {
-        Host::Domain(domain) => (
-            domain.to_owned(),
-            tokio::net::lookup_host((domain, port))
-                .await
-                .context("Resolve target host")?
-                .take(32)
-                .collect(),
-        ),
+        Host::Domain(domain) => {
+            let host = domain.to_owned();
+            let lookup_host = host.clone();
+            let addresses = resolve_with(DNS_PERMITS.clone(), move || {
+                (lookup_host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.take(32).collect())
+            })
+            .await?;
+            (host, addresses)
+        }
         Host::Ipv4(ip) => (ip.to_string(), vec![SocketAddr::new(IpAddr::V4(ip), port)]),
         Host::Ipv6(ip) => (ip.to_string(), vec![SocketAddr::new(IpAddr::V6(ip), port)]),
     };
@@ -241,6 +268,82 @@ async fn send(run: &Run, allow_private: bool) -> anyhow::Result<reqwest::Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_lookup_keeps_capacity_until_the_blocking_job_finishes() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (started, did_start) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, did_finish) = tokio::sync::oneshot::channel();
+        let capacity = permits.clone();
+        let task = tokio::spawn(async move {
+            resolve_with(capacity, move || {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+                finished.send(()).unwrap();
+                Ok(vec![])
+            })
+            .await
+        });
+        did_start.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let prematurely_available = permits.try_acquire().is_ok();
+        // Always release the blocking job before asserting; runtime shutdown
+        // waits for it even when the async caller was cancelled.
+        release.send(()).unwrap();
+        did_finish.await.unwrap();
+        let restored = tokio::time::timeout(Duration::from_secs(1), permits.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(restored);
+        assert!(
+            !prematurely_available,
+            "cancelled DNS job escaped its concurrency budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_start_another_dns_job() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let permits = Arc::new(Semaphore::new(1));
+        let occupied = permits.acquire().await.unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let marker = called.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            resolve_with(permits.clone(), move || {
+                marker.store(true, Ordering::SeqCst);
+                Ok(vec![])
+            }),
+        )
+        .await;
+        drop(occupied);
+        assert!(
+            result.is_err(),
+            "lookup started while DNS capacity was exhausted"
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_lookup_releases_capacity_for_the_next_request() {
+        let permits = Arc::new(Semaphore::new(1));
+        assert!(
+            resolve_with(permits.clone(), || Err(std::io::Error::other(
+                "test lookup failure"
+            )))
+            .await
+            .is_err()
+        );
+        assert_eq!(permits.available_permits(), 1);
+        let addresses = resolve_with(permits, || Ok(vec!["127.0.0.1:80".parse().unwrap()]))
+            .await
+            .unwrap();
+        assert_eq!(addresses.len(), 1);
+    }
 
     #[test]
     fn rejects_special_ipv6_ranges_and_transition_tunnels() {
