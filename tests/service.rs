@@ -72,7 +72,7 @@ async fn migrate_command_and_store_apply_initial_schema_idempotently(pool: sqlx:
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions, [1, 2, 3, 4]);
+    assert_eq!(versions, [1, 2, 3, 4, 5, 6]);
     let store = Store::connect(&url).await.unwrap();
     let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
         .fetch_one(&store.pool)
@@ -587,7 +587,7 @@ mod api_tests {
     use scheduler_service::{
         api::{self, AppState},
         domain::Trigger,
-        store::Store,
+        store::{Store, StoreError},
     };
     use serde_json::{Value, json};
     use sqlx::PgPool;
@@ -707,6 +707,20 @@ mod api_tests {
         )
         .await;
         assert_eq!(list, json!([]));
+        let at = store.now().await.unwrap() - chrono::Duration::seconds(1);
+        let schedule = store
+            .create("tenant-a", super::schedule_spec(at), at, None, "test")
+            .await
+            .unwrap();
+        let run = super::seed_run(&store.pool, &schedule, 0, false).await;
+        assert!(matches!(
+            store.attempts("tenant-b", run.id).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.replay("tenant-b", run.id).await,
+            Err(StoreError::NotFound)
+        ));
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires PostgreSQL; run scripts/test.sh"]
@@ -778,6 +792,36 @@ mod api_tests {
                 &app,
                 "GET",
                 "/v1/schedules?limit=101",
+                Some("tenant-a-test-secret"),
+                Value::Null,
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        for age in [0, 31_536_001] {
+            let mut invalid = spec(Utc::now());
+            invalid.retry.max_age_seconds = Some(age);
+            assert_eq!(
+                request(
+                    &app,
+                    "POST",
+                    "/v1/schedules",
+                    Some("tenant-a-test-secret"),
+                    serde_json::to_value(invalid).unwrap(),
+                    None
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                "/v1/schedules?status=pending",
                 Some("tenant-a-test-secret"),
                 Value::Null,
                 None
@@ -1107,7 +1151,7 @@ mod engine_tests {
 mod claim_tests {
     use super::schedule_spec as spec;
     use scheduler_service::{
-        domain::{ConcurrencyPolicy, Run, Schedule},
+        domain::{ConcurrencyPolicy, DeliveryResult, Run, Schedule},
         store::Store,
     };
     use sqlx::PgPool;
@@ -1182,6 +1226,25 @@ mod claim_tests {
         assert!(store.claim().await.unwrap().is_none());
         let other = create_run(&store).await;
         assert_eq!(store.claim().await.unwrap().unwrap().schedule_id, other.id);
+        assert!(
+            store
+                .finish(
+                    &claims[0],
+                    DeliveryResult {
+                        success: true,
+                        http_status: Some(200),
+                        error: None,
+                        response_excerpt: None,
+                        retry_after: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.claim().await.unwrap().unwrap().schedule_id,
+            schedule.id
+        );
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires PostgreSQL; run scripts/test.sh"]
@@ -1355,7 +1418,7 @@ mod retry_tests {
         routing::post,
     };
     use scheduler_service::{
-        domain::{Attempt, DeliveryResult, RetryPolicy, Run},
+        domain::{Attempt, DeliveryResult, RetryAfter, RetryPolicy, Run},
         store::Store,
         webhook,
     };
@@ -1441,9 +1504,13 @@ mod retry_tests {
                         body,
                     ));
                     if messages.len() == 1 {
-                        (StatusCode::SERVICE_UNAVAILABLE, "retry")
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "7")],
+                            "retry",
+                        )
                     } else {
-                        (StatusCode::OK, "accepted")
+                        (StatusCode::OK, [("retry-after", "999")], "accepted")
                     }
                 }
             }),
@@ -1463,14 +1530,18 @@ mod retry_tests {
             .unwrap();
         store.materialize(&schedule, &[at], None).await.unwrap();
         let first = store.claim().await.unwrap().unwrap();
+        let denied = webhook::deliver(&first, false).await;
+        assert!(denied.error.unwrap().contains("Private/reserved"));
+        assert!(received.lock().unwrap().is_empty());
         let outcome = webhook::deliver(&first, true).await;
         assert_eq!(outcome.http_status, Some(503));
         assert!(!outcome.success);
+        assert_eq!(outcome.retry_after, Some(RetryAfter::Seconds(7)));
         let before = store.now().await.unwrap();
         assert!(store.finish(&first, outcome).await.unwrap());
         let waiting = get_run(&store, first.id).await;
         assert_eq!(waiting.status, "pending");
-        assert!(waiting.available_at >= before + chrono::Duration::seconds(5));
+        assert!(waiting.available_at >= before + chrono::Duration::seconds(7));
         assert!(waiting.lease_token.is_none());
         assert!(store.claim().await.unwrap().is_none());
         make_ready(&store, first.id).await;
@@ -1480,6 +1551,7 @@ mod retry_tests {
         assert!(!store.finish(&first, success()).await.unwrap());
         let outcome = webhook::deliver(&second, true).await;
         assert!(outcome.success);
+        assert!(outcome.retry_after.is_none());
         assert!(store.finish(&second, outcome).await.unwrap());
         assert!(!store.finish(&second, success()).await.unwrap());
         let saved = get_run(&store, first.id).await;
@@ -2616,6 +2688,15 @@ mod expiry_tests {
             .execute(&store.pool)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0005_batch_and_run_search.sql"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0006_evaluation_retries.sql"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.due_schedules(10).await.unwrap()[0].id, schedule.id);
         assert!(
             store
                 .get_schedule("tenant-a", schedule.id)
@@ -3720,6 +3801,10 @@ mod recurrence_tests {
             "/bin/false",
             "/bin/echo",
         ] {
+            store
+                .transition("tenant-a", schedule.id, "resume")
+                .await
+                .unwrap();
             let unavailable = Evaluator::new(executable.into(), Duration::from_secs(2));
             scheduler_tick(&store, &unavailable).await.unwrap();
             let current = store.get_schedule("tenant-a", schedule.id).await.unwrap();
@@ -3757,6 +3842,10 @@ mod recurrence_tests {
                 assert!(!body.to_string().contains(executable));
             }
         }
+        store
+            .transition("tenant-a", schedule.id, "resume")
+            .await
+            .unwrap();
         scheduler_tick(&store, &evaluator()).await.unwrap();
         assert_eq!(
             store

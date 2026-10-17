@@ -88,6 +88,20 @@ impl Store {
         key: Option<&str>,
         hash: &str,
     ) -> Result<Schedule> {
+        self.create_with_outcome(tenant, spec, next, key, hash)
+            .await
+            .map(|(_, schedule)| schedule)
+    }
+
+    /// Distinguish an inserted schedule from a concurrent idempotent retry.
+    pub async fn create_with_outcome(
+        &self,
+        tenant: &str,
+        spec: ScheduleSpec,
+        next: DateTime<Utc>,
+        key: Option<&str>,
+        hash: &str,
+    ) -> Result<(bool, Schedule)> {
         let result = sqlx::query_as::<_, Schedule>(
             "INSERT INTO schedules (id, tenant_id, spec, status, next_fire_at, idempotency_key, request_hash)
              VALUES ($1, $2, $3, 'active', $4, $5, $6)
@@ -95,10 +109,11 @@ impl Store {
             .bind(Uuid::new_v4()).bind(tenant).bind(Json(spec)).bind(next).bind(key).bind(hash)
             .fetch_optional(&self.pool).await?;
         match result {
-            Some(schedule) => Ok(schedule),
+            Some(schedule) => Ok((true, schedule)),
             None => self
                 .find_idempotent(tenant, key.unwrap_or_default(), hash)
                 .await?
+                .map(|schedule| (false, schedule))
                 .ok_or(StoreError::NotFound),
         }
     }
@@ -153,14 +168,37 @@ impl Store {
         } else {
             "active"
         };
-        let updated = sqlx::query_as("UPDATE schedules SET spec = $2, revision = revision + 1, status = $3, next_fire_at = $4, last_error = NULL, updated_at = clock_timestamp() WHERE id = $1 RETURNING *")
+        let updated = sqlx::query_as("UPDATE schedules SET spec = $2, revision = revision + 1, status = $3, next_fire_at = $4, last_error = NULL, evaluation_retry_at = NULL, updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1 RETURNING *")
             .bind(id).bind(Json(spec)).bind(status).bind(next).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(updated)
     }
     pub async fn due_schedules(&self, limit: i64) -> Result<Vec<Schedule>> {
-        Ok(sqlx::query_as("SELECT * FROM schedules WHERE status = 'active' AND next_fire_at <= clock_timestamp() ORDER BY next_fire_at, id LIMIT $1")
+        Ok(sqlx::query_as("SELECT * FROM schedules WHERE status = 'active' AND next_fire_at <= statement_timestamp()
+            AND COALESCE(evaluation_retry_at, next_fire_at) <= statement_timestamp()
+            ORDER BY COALESCE(evaluation_retry_at, next_fire_at), id LIMIT $1")
             .bind(limit).fetch_all(&self.pool).await?)
+    }
+
+    /// Defer transient failures without changing the occurrence cursor.
+    pub async fn defer_evaluation(&self, snapshot: &Schedule) -> Result<()> {
+        // Retry metadata must not invalidate a valid parallel expansion. Only
+        // lifecycle/cursor writes advance updated_at; their stamp still fences
+        // old failures. Concurrent failures cannot keep extending a cooldown.
+        sqlx::query(
+            "UPDATE schedules SET evaluation_retry_at = clock_timestamp() + INTERVAL '5 seconds'
+            WHERE id = $1 AND tenant_id = $2 AND revision = $3
+            AND next_fire_at IS NOT DISTINCT FROM $4 AND status = 'active' AND updated_at = $5
+            AND (evaluation_retry_at IS NULL OR evaluation_retry_at <= statement_timestamp())",
+        )
+        .bind(snapshot.id)
+        .bind(&snapshot.tenant_id)
+        .bind(snapshot.revision)
+        .bind(snapshot.next_fire_at)
+        .bind(snapshot.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
     pub async fn materialize(
         &self,
@@ -173,6 +211,9 @@ impl Store {
         if current.status != "active"
             || current.revision != snapshot.revision
             || current.next_fire_at != snapshot.next_fire_at
+            // Pausing and resuming preserves both revision and cursor. The
+            // monotonic update timestamp also fences that lifecycle change.
+            || current.updated_at != snapshot.updated_at
         {
             return Ok(false);
         }
@@ -213,15 +254,15 @@ impl Store {
         } else {
             "completed"
         };
-        sqlx::query("UPDATE schedules SET next_fire_at = $2, status = $3, last_error = NULL, updated_at = clock_timestamp() WHERE id = $1")
+        sqlx::query("UPDATE schedules SET next_fire_at = $2, status = $3, last_error = NULL, evaluation_retry_at = NULL, updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1")
             .bind(current.id).bind(next).bind(status).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(true)
     }
     pub async fn rule_error(&self, snapshot: &Schedule, error: &str) -> Result<()> {
-        sqlx::query("UPDATE schedules SET status = 'error', last_error = $4, updated_at = clock_timestamp()
-            WHERE id = $1 AND revision = $2 AND next_fire_at IS NOT DISTINCT FROM $3 AND status = 'active'")
-            .bind(snapshot.id).bind(snapshot.revision).bind(snapshot.next_fire_at).bind(error)
+        sqlx::query("UPDATE schedules SET status = 'error', last_error = $4, evaluation_retry_at = NULL, updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond')
+            WHERE id = $1 AND revision = $2 AND next_fire_at IS NOT DISTINCT FROM $3 AND status = 'active' AND updated_at = $5")
+            .bind(snapshot.id).bind(snapshot.revision).bind(snapshot.next_fire_at).bind(error).bind(snapshot.updated_at)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -309,7 +350,7 @@ impl Store {
         // entire batch of expired runs must not starve unrelated recovery.
         let expired: Vec<Run> = sqlx::query_as(
             "SELECT r.* FROM runs r JOIN schedules s ON s.id = r.schedule_id
-            WHERE r.status = 'running' AND r.lease_until <= clock_timestamp()
+            WHERE r.status = 'running' AND r.lease_until <= statement_timestamp()
             ORDER BY r.lease_until, r.id LIMIT 100 FOR UPDATE OF s SKIP LOCKED",
         )
         .fetch_all(&mut *tx)
@@ -354,7 +395,7 @@ impl Store {
             sqlx::query("UPDATE runs SET status = 'cancelled', finished_at = clock_timestamp(), last_error = 'Schedule cancelled' WHERE schedule_id = $1 AND status = 'pending'")
                 .bind(id).execute(&mut *tx).await?;
         }
-        let updated = sqlx::query_as("UPDATE schedules SET status = $2, updated_at = clock_timestamp() WHERE id = $1 RETURNING *")
+        let updated = sqlx::query_as("UPDATE schedules SET status = $2, evaluation_retry_at = NULL, updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1 RETURNING *")
             .bind(id).bind(status).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(updated)
@@ -375,8 +416,55 @@ impl Store {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Run>> {
-        Ok(sqlx::query_as("SELECT * FROM runs WHERE tenant_id = $1 AND ($2::uuid IS NULL OR schedule_id = $2) AND ($3::text IS NULL OR status = $3) ORDER BY created_at DESC, id DESC LIMIT $4 OFFSET $5")
-            .bind(tenant).bind(schedule).bind(status).bind(limit).bind(offset).fetch_all(&self.pool).await?)
+        self.search_runs(
+            tenant,
+            RunFilter {
+                schedule_id: schedule,
+                status,
+                ..Default::default()
+            },
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    /// Search immutable run snapshots with selective indexable predicates.
+    pub async fn search_runs(
+        &self,
+        tenant: &str,
+        filter: RunFilter<'_>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Run>> {
+        filter.validate()?;
+        // Add only requested predicates so PostgreSQL can use selective
+        // indexes instead of nullable-parameter OR branches in generic plans.
+        let mut sql = QueryBuilder::<Postgres>::new("SELECT * FROM runs WHERE tenant_id = ");
+        sql.push_bind(tenant);
+        if let Some(schedule) = filter.schedule_id {
+            sql.push(" AND schedule_id = ").push_bind(schedule);
+        }
+        if let Some(status) = filter.status {
+            sql.push(" AND status = ").push_bind(status);
+        }
+        if let Some(metadata) = filter.metadata
+            && !metadata.is_empty()
+        {
+            sql.push(" AND (spec -> 'metadata') @> ")
+                .push_bind(Json(metadata));
+        }
+        if let Some(from) = filter.from {
+            sql.push(" AND scheduled_at >= ").push_bind(from);
+        }
+        if let Some(until) = filter.until {
+            sql.push(" AND scheduled_at < ").push_bind(until);
+        }
+        sql.push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(limit.clamp(1, 100))
+            .push(" OFFSET ")
+            .push_bind(offset.clamp(0, 100_000));
+        Ok(sql.build_query_as().fetch_all(&self.pool).await?)
     }
     pub async fn attempts(&self, tenant: &str, id: Uuid) -> Result<Vec<Attempt>> {
         self.list_attempts(tenant, id, 100, None).await
@@ -397,22 +485,18 @@ impl Store {
         Ok(run)
     }
     pub async fn stats(&self, tenant: &str) -> Result<serde_json::Value> {
-        let schedule_counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT status, COUNT(*) FROM schedules WHERE tenant_id = $1 GROUP BY status",
+        // One round trip and one MVCC snapshot: the two groups must describe
+        // the same committed state while workers and operators change runs.
+        Ok(sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'schedules', (SELECT COALESCE(jsonb_object_agg(status, n), '{}'::jsonb)
+                    FROM (SELECT status, COUNT(*) n FROM schedules WHERE tenant_id = $1 GROUP BY status) counts),
+                'runs', (SELECT COALESCE(jsonb_object_agg(status, n), '{}'::jsonb)
+                    FROM (SELECT status, COUNT(*) n FROM runs WHERE tenant_id = $1 GROUP BY status) counts))",
         )
         .bind(tenant)
-        .fetch_all(&self.pool)
-        .await?;
-        let run_counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT status, COUNT(*) FROM runs WHERE tenant_id = $1 GROUP BY status",
-        )
-        .bind(tenant)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(serde_json::json!({
-            "schedules": schedule_counts.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
-            "runs": run_counts.into_iter().collect::<std::collections::BTreeMap<_, _>>()
-        }))
+        .fetch_one(&self.pool)
+        .await?)
     }
     pub async fn expire_pending(&self) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
@@ -587,9 +671,13 @@ impl Store {
             // position treats %, _ and backslashes as literal characters.
             sql.push(" AND (position(lower(")
                 .push_bind(query)
-                .push(") in lower(spec->>'name')) > 0 OR id::text = ")
-                .push_bind(query)
-                .push(")");
+                .push(") in lower(spec->>'name')) > 0");
+            // UUID text is case-insensitive and has several valid spellings.
+            // Compare a parsed UUID instead of its lowercase display string.
+            if let Ok(id) = Uuid::parse_str(query) {
+                sql.push(" OR id = ").push_bind(id);
+            }
+            sql.push(")");
         }
         if let Some(metadata) = filter.metadata {
             crate::metadata::validate(metadata)
@@ -658,4 +746,36 @@ pub struct ScheduleFilter<'a> {
     pub status: Option<&'a str>,
     pub query: Option<&'a str>,
     pub metadata: Option<&'a crate::metadata::Metadata>,
+}
+
+#[derive(Default)]
+pub struct RunFilter<'a> {
+    pub schedule_id: Option<Uuid>,
+    pub status: Option<&'a str>,
+    pub metadata: Option<&'a crate::metadata::Metadata>,
+    /// Inclusive lower bound on the original scheduled time.
+    pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on the original scheduled time.
+    pub until: Option<DateTime<Utc>>,
+}
+
+impl RunFilter<'_> {
+    fn validate(&self) -> Result<()> {
+        if let (Some(from), Some(until)) = (self.from, self.until)
+            && from >= until
+        {
+            return Err(StoreError::InvalidInput(
+                "from must be earlier than until".into(),
+            ));
+        }
+        for date in [self.from, self.until].into_iter().flatten() {
+            crate::trigger::validate_once(date)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        }
+        if let Some(metadata) = self.metadata {
+            crate::metadata::validate(metadata)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        }
+        Ok(())
+    }
 }

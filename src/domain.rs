@@ -34,7 +34,7 @@ pub struct HttpTarget {
     pub timeout_seconds: u32,
 }
 
-fn default_timeout() -> u32 {
+pub(crate) fn default_timeout() -> u32 {
     30
 }
 
@@ -44,7 +44,7 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub initial_delay_seconds: u32,
     pub max_delay_seconds: u32,
-    /// No new attempt may start after scheduled_at + max_age_seconds.
+    /// No new attempt may be claimed at or after scheduled_at + max_age_seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_age_seconds: Option<u32>,
 }

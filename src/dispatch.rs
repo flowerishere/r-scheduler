@@ -4,7 +4,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::{
-    domain::{ConcurrencyPolicy, Run, Schedule},
+    domain::{ConcurrencyPolicy, Run, Schedule, default_timeout},
     store::{Store, StoreError},
 };
 
@@ -112,10 +112,22 @@ impl Store {
         // A locked schedule must not trap arbitration on the same tenant. Move
         // unsuccessful turns back as well, and bound each transaction's work.
         for _ in 0..8 {
-            let tenant: Option<String> = sqlx::query_scalar(include_str!("sql/claim_tenant.sql"))
-                .bind(&visited)
-                .fetch_optional(&mut *tx)
-                .await?;
+            let mut tenant: Option<String> =
+                sqlx::query_scalar(include_str!("sql/claim_tenant.sql"))
+                    .bind(&visited)
+                    .bind(false)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if tenant.is_none() {
+                // The first fair turns may all be empty, throttled or locked.
+                // Seek distinct pending tenants without scanning old tenants
+                // or every run in a large tenant backlog, then order fairly.
+                tenant = sqlx::query_scalar(include_str!("sql/claim_tenant.sql"))
+                    .bind(&visited)
+                    .bind(true)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            }
             let Some(tenant) = tenant else {
                 break;
             };
@@ -166,26 +178,17 @@ impl Store {
                 return Ok(None);
             }
         }
-        let candidate: Option<Run> = sqlx::query_as("SELECT * FROM runs WHERE schedule_id = $1 AND revision = $2 AND status = 'pending' AND available_at <= statement_timestamp() AND (expires_at IS NULL OR expires_at > statement_timestamp()) ORDER BY available_at, id LIMIT 1 FOR UPDATE SKIP LOCKED")
-            .bind(schedule.id).bind(schedule.revision).fetch_optional(&mut **tx).await?;
-        let Some(candidate) = candidate else {
-            return Ok(None);
-        };
-        let token = Uuid::new_v4();
-        let lease_seconds = i64::from(candidate.spec.target.timeout_seconds) + 15;
-        let run: Option<Run> = sqlx::query_as("UPDATE runs SET status = 'running', attempt_count = attempt_count + 1, cycle_attempts = cycle_attempts + 1, lease_token = $2, lease_until = clock_timestamp() + make_interval(secs => $3::double precision), finished_at = NULL WHERE id = $1 AND (expires_at IS NULL OR expires_at > clock_timestamp()) RETURNING *")
-            .bind(candidate.id).bind(token).bind(lease_seconds as f64).fetch_optional(&mut **tx).await?;
-        let Some(run) = run else {
-            return Ok(None);
-        };
-        sqlx::query("INSERT INTO attempts (id, run_id, number, status, lease_token) VALUES ($1, $2, $3, 'running', $4)")
-            .bind(Uuid::new_v4()).bind(run.id).bind(run.attempt_count).bind(token).execute(&mut **tx).await?;
-        sqlx::query(
-            "UPDATE tenant_dispatch SET last_served = nextval('tenant_dispatch_order'),
-                tokens = CASE WHEN rate_per_second IS NULL THEN tokens ELSE
-                    LEAST(burst::float8, tokens + GREATEST(EXTRACT(EPOCH FROM (statement_timestamp() - token_time)), 0)::float8 * rate_per_second) - 1 END,
-                token_time = GREATEST(token_time, statement_timestamp()) WHERE tenant_id = $1")
-            .bind(tenant).execute(&mut **tx).await?;
-        Ok(Some(run))
+        // The locked parent and fresh quota checks above still serialize
+        // admission. Lease, attempt and token writes now share one round trip;
+        // only the final run snapshot (including payload) crosses the wire.
+        Ok(sqlx::query_as(include_str!("sql/lease_run.sql"))
+            .bind(schedule.id)
+            .bind(schedule.revision)
+            .bind(Uuid::new_v4())
+            .bind(i64::from(default_timeout()))
+            .bind(Uuid::new_v4())
+            .bind(tenant)
+            .fetch_optional(&mut **tx)
+            .await?)
     }
 }

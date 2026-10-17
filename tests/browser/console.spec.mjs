@@ -45,6 +45,31 @@ async function getSchedule(request, id) {
   return response.json();
 }
 
+async function pendingRetry(request, name) {
+  const schedule = await create(request, name, {
+    trigger: {type: "delay", seconds: 0}, target: {url: callback.replace(/\/ok$/, "/fail")},
+    retry: {max_attempts: 3, initial_delay_seconds: 86400, max_delay_seconds: 86400, max_age_seconds: 172800},
+  });
+  let run;
+  await expect.poll(async () => {
+    const rows = await (await request.get(`/v1/runs?schedule_id=${schedule.id}`, {headers: auth()})).json();
+    run = rows[0];
+    return run?.status === "pending" && run?.attempt_count === 1;
+  }).toBe(true);
+  expect((await request.post(`/v1/schedules/${schedule.id}/pause`, {headers: auth()})).ok()).toBeTruthy();
+  return {schedule, run};
+}
+
+async function openRun(page, run) {
+  await login(page);
+  await page.getByRole("button", {name: "执行记录", exact: true}).click();
+  await page.locator("#run-schedule-id").fill(run.schedule_id);
+  await page.getByRole("button", {name: "筛选", exact: true}).click();
+  const row = page.locator("tbody tr").filter({hasText: run.spec.name});
+  await row.getByRole("button", {name: "详情", exact: true}).click();
+  await expect(page.getByRole("heading", {name: "管理待执行实例", exact: true})).toBeVisible();
+}
+
 test("login, memory-only credentials, tenant isolation and reload", async ({page, request}) => {
   await page.goto("/console");
   await page.getByLabel("API key", {exact: true}).fill("invalid-key");
@@ -529,7 +554,9 @@ test("business metadata can be created, filtered, edited and cleared", async ({p
   await expect(page.locator("#metadata-value")).toHaveValue("");
   await expect(page.locator("#list-error")).toBeHidden();
   await page.getByRole("button", {name: "执行记录", exact: true}).click();
-  await expect(page.locator("#metadata-filter")).toBeHidden();
+  await expect(page.locator("#metadata-filter")).toBeVisible();
+  await expect(page.locator("#metadata-key")).toHaveValue("");
+  await expect(page.locator("#metadata-value")).toHaveValue("");
 });
 
 test("RRULE exception dates require a timezone in preview and save", async ({page}) => {
@@ -549,4 +576,191 @@ test("RRULE exception dates require a timezone in preview and save", async ({pag
   await expect(page.locator("#preview-result li")).toHaveCount(2);
   await page.getByRole("button", {name: "创建计划", exact: true}).click();
   await expect(page.locator("#editor")).toBeHidden();
+});
+
+test("pending retry can be deferred and cancelled without changing its schedule", async ({page, request}) => {
+  const {schedule, run} = await pendingRetry(request, "pending-controls-defer-cancel");
+  const before = await getSchedule(request, schedule.id);
+  await openRun(page, run);
+  await page.setViewportSize({width: 390, height: 844});
+  await expect(page.getByLabel("从现在起延后多少秒入队", {exact: true})).toBeVisible();
+  expect(await page.locator("#detail").evaluate((dialog) => dialog.scrollWidth <= dialog.clientWidth)).toBe(true);
+  await page.locator(".run-controls").screenshot({path: test.info().outputPath("pending-run-controls-mobile.png")});
+  await page.getByLabel("从现在起延后多少秒入队", {exact: true}).fill("120");
+  const updated = page.waitForResponse((response) => response.url().endsWith(`/runs/${run.id}/reschedule`) && response.request().method() === "POST");
+  await page.getByRole("button", {name: "调整入队时间", exact: true}).click();
+  expect((await updated).status()).toBe(200);
+  await expect(page.locator("#toast")).toHaveText("实例入队时间已调整");
+  const deferred = await (await request.get(`/v1/runs/${run.id}`, {headers: auth()})).json();
+  expect(deferred.id).toBe(run.id);
+  expect(deferred.scheduled_at).toBe(run.scheduled_at);
+  expect(deferred.expires_at).toBe(run.expires_at);
+  expect(deferred.attempt_count).toBe(1);
+  expect(Date.parse(deferred.available_at)).toBeGreaterThan(Date.now() + 110000);
+  await page.getByRole("button", {name: "取消实例", exact: true}).click();
+  await page.locator("#confirm").getByRole("button", {name: "取消实例", exact: true}).click();
+  await expect(page.locator("#detail-content .badge").first()).toHaveText("已取消");
+  await expect(page.getByRole("heading", {name: "管理待执行实例", exact: true})).toHaveCount(0);
+  const cancelled = await (await request.get(`/v1/runs/${run.id}`, {headers: auth()})).json();
+  expect(cancelled.status).toBe("cancelled");
+  expect(cancelled.attempt_count).toBe(1);
+  expect(await getSchedule(request, schedule.id)).toEqual(before);
+  expect(await (await request.get(`/v1/runs/${run.id}/attempts`, {headers: auth()})).json()).toHaveLength(1);
+});
+
+test("immediate enqueue retains the original run and obeys schedule pause", async ({page, request}) => {
+  const {schedule, run} = await pendingRetry(request, "pending-controls-enqueue");
+  await openRun(page, run);
+  await page.getByRole("button", {name: "立即入队", exact: true}).click();
+  await expect(page.locator("#confirm-description")).toContainText("暂停状态");
+  const updated = page.waitForResponse((response) => response.url().endsWith(`/runs/${run.id}/reschedule`) && response.request().method() === "POST");
+  await page.locator("#confirm").getByRole("button", {name: "立即入队", exact: true}).click();
+  expect((await updated).status()).toBe(200);
+  const pending = await (await request.get(`/v1/runs/${run.id}`, {headers: auth()})).json();
+  expect(pending.status).toBe("pending");
+  expect(pending.attempt_count).toBe(1);
+  expect(Date.parse(pending.available_at)).toBeLessThanOrEqual(Date.now());
+  expect(pending.scheduled_at).toBe(run.scheduled_at);
+  expect(pending.expires_at).toBe(run.expires_at);
+  expect((await request.post(`/v1/schedules/${schedule.id}/resume`, {headers: auth()})).ok()).toBeTruthy();
+  await expect.poll(async () => {
+    const current = await (await request.get(`/v1/runs/${run.id}`, {headers: auth()})).json();
+    return current.status === "pending" && current.attempt_count === 2;
+  }).toBe(true);
+  expect(await (await request.get(`/v1/runs/${run.id}/attempts`, {headers: auth()})).json()).toHaveLength(2);
+  expect((await request.post(`/v1/runs/${run.id}/cancel`, {headers: auth()})).ok()).toBeTruthy();
+});
+
+test("stale pending-run details cannot overwrite another availability change", async ({page, request}) => {
+  const {run} = await pendingRetry(request, "pending-controls-conflict");
+  await openRun(page, run);
+  const response = await request.post(`/v1/runs/${run.id}/reschedule`, {headers: auth(), data: {
+    expected_available_at: run.available_at, timing: {type: "delay", seconds: 90},
+  }});
+  expect(response.ok()).toBeTruthy();
+  const changed = await response.json();
+  await page.getByLabel("从现在起延后多少秒入队", {exact: true}).fill("30");
+  await page.getByRole("button", {name: "调整入队时间", exact: true}).click();
+  await expect(page.locator("#detail-content .error").first()).toContainText("Run availability changed");
+  expect((await (await request.get(`/v1/runs/${run.id}`, {headers: auth()})).json()).available_at).toBe(changed.available_at);
+  await page.getByRole("button", {name: "刷新详情", exact: true}).click();
+  await expect(page.locator("#detail-content .error")).toHaveCount(0);
+  await page.getByLabel("从现在起延后多少秒入队", {exact: true}).fill("120");
+  const saved = page.waitForResponse((result) => result.url().endsWith(`/runs/${run.id}/reschedule`) && result.request().method() === "POST");
+  await page.getByRole("button", {name: "调整入队时间", exact: true}).click();
+  expect((await saved).status()).toBe(200);
+  expect((await request.post(`/v1/runs/${run.id}/cancel`, {headers: auth()})).ok()).toBeTruthy();
+});
+
+test("extended years supported by the API can be displayed and edited", async ({page, request}) => {
+  for (const [index, at] of ["-4713-11-24T00:00:00Z", "+10000-01-01T00:00:00Z"].entries()) {
+    const schedule = await create(request, `extended-year-${index}`, {trigger: {type: "once", at}});
+    await login(page);
+    await search(page, schedule.spec.name);
+    await expect(page.locator("#list-error")).toBeHidden();
+    const row = page.locator("tbody tr").filter({hasText: schedule.spec.name});
+    await expect(row).toBeVisible();
+    await row.getByRole("button", {name: "详情", exact: true}).click();
+    await expect(page.locator("#detail-title")).toHaveText(schedule.spec.name);
+    await expect(page.locator("#detail-content .error")).toHaveCount(0);
+    await page.getByRole("button", {name: "编辑计划", exact: true}).click();
+    await expect(page.locator("#once-at")).toHaveValue(at);
+    await page.getByLabel("计划名称", {exact: true}).fill(`${schedule.spec.name}-edited`);
+    await page.getByRole("button", {name: "保存修改"}).click();
+    await expect(page.locator("#editor")).toBeHidden();
+    const updated = await getSchedule(request, schedule.id);
+    expect(updated.revision).toBe(2);
+    expect(updated.spec.trigger.at).toBe(at);
+  }
+});
+
+test("batch import retries a committed request with the same key and preserves integer payloads", async ({page, request}) => {
+  await login(page);
+  const keys = [], statuses = [];
+  await page.route("**/v1/schedules/batch", async (route) => {
+    keys.push(route.request().headers()["idempotency-key"]);
+    const response = await route.fetch();
+    statuses.push(response.status());
+    if (keys.length === 1) await route.fulfill({status: 503, contentType: "application/json", body: '{"error":"模拟响应丢失，请重试"}'});
+    else await route.fulfill({response});
+  });
+  await page.getByRole("button", {name: "批量导入", exact: true}).click();
+  const input = `{"schedules":[{"name":"batch-browser-first","trigger":{"type":"delay","seconds":86400},"target":{"url":${JSON.stringify(callback)}},"payload":{"order_id":9007199254740993}},{"name":"batch-browser-second","trigger":{"type":"delay","seconds":86400},"target":{"url":${JSON.stringify(callback)}}}]}`;
+  await page.getByLabel("批量计划（JSON）").fill(input);
+  await page.getByRole("button", {name: "导入计划", exact: true}).click();
+  await expect(page.locator("#batch-error")).toContainText("模拟响应丢失");
+  await page.getByLabel("批量计划（JSON）").fill(`\n${input}\n`);
+  await page.getByRole("button", {name: "导入计划", exact: true}).click();
+  await expect(page.locator("#batch-import")).toBeHidden();
+  expect(keys).toHaveLength(2);
+  expect(keys[0]).toBe(keys[1]);
+  expect(statuses).toEqual([201, 200]);
+  const response = await request.get("/v1/schedules?q=batch-browser-", {headers: auth()});
+  const raw = await response.text();
+  expect(JSON.parse(raw)).toHaveLength(2);
+  expect(raw).toContain('"order_id":9007199254740993');
+  await search(page, "batch-browser-");
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+});
+
+test("invalid batch import leaves all schedules unchanged and keeps the draft", async ({page, request}) => {
+  await login(page);
+  await page.getByRole("button", {name: "批量导入", exact: true}).click();
+  const body = {schedules: [
+    {name: "batch-invalid-first", trigger: {type: "delay", seconds: 86400}, target: {url: callback}},
+    {name: "batch-invalid-second", trigger: {type: "delay", seconds: 86400}, target: {url: "file:///tmp/hook"}},
+  ]};
+  await page.getByLabel("批量计划（JSON）").fill(JSON.stringify(body));
+  await page.getByRole("button", {name: "导入计划", exact: true}).click();
+  await expect(page.locator("#batch-error")).toBeVisible();
+  await expect(page.locator("#batch-import")).toBeVisible();
+  await expect(page.getByLabel("批量计划（JSON）")).toHaveValue(JSON.stringify(body));
+  const response = await request.get("/v1/schedules?q=batch-invalid-", {headers: auth()});
+  expect(await response.json()).toEqual([]);
+  await page.getByRole("button", {name: "关闭批量导入"}).click();
+});
+
+test("execution history combines original metadata with precise time bounds", async ({page, request}) => {
+  const at = "2020-01-01T00:00:00.000001Z";
+  const schedule = await create(request, "run-search-browser", {trigger: {type: "once", at}, metadata: {"order.id": "history-search"}});
+  await expect.poll(async () => {
+    const response = await request.get(`/v1/runs?schedule_id=${schedule.id}`, {headers: auth()});
+    return (await response.json()).length;
+  }).toBe(1);
+  await login(page);
+  await page.getByRole("button", {name: "执行记录", exact: true}).click();
+  await expect(page.locator("#run-schedule-field")).toBeVisible();
+  await page.locator("#metadata-filter summary").click();
+  await page.locator("#metadata-key").fill("order.id");
+  await page.locator("#metadata-value").fill("history-search");
+  await page.locator("#run-time-filter summary").click();
+  await page.getByLabel("开始时间（含）").fill(at);
+  await page.getByLabel("结束时间（不含）").fill("2020-01-01T00:00:00.000002Z");
+  await page.getByRole("button", {name: "筛选", exact: true}).click();
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expect(page.locator("tbody tr")).toContainText(schedule.spec.name);
+  await page.locator("#metadata-value").fill("does-not-match");
+  await page.getByRole("button", {name: "筛选", exact: true}).click();
+  await expect(page.locator("#empty-state")).toBeVisible();
+  await page.locator("#metadata-value").fill("history-search");
+  await page.getByLabel("结束时间（不含）").fill(at);
+  await page.getByRole("button", {name: "筛选", exact: true}).click();
+  await expect(page.locator("#list-error")).toContainText("from must be earlier than until");
+});
+
+test("saved-rule preview works while paused without changing the schedule", async ({page, request}) => {
+  const schedule = await create(request, "saved-preview-browser", {trigger: {type: "rrule", value: "DTSTART:20300101T090000Z\nRRULE:FREQ=DAILY;COUNT=3\nEXDATE:20300102T090000Z"}});
+  expect((await request.post(`/v1/schedules/${schedule.id}/pause`, {headers: auth()})).ok()).toBeTruthy();
+  const before = await getSchedule(request, schedule.id);
+  await login(page);
+  await search(page, schedule.spec.name);
+  await page.locator("tbody tr").getByRole("button", {name: "详情", exact: true}).click();
+  await page.getByRole("button", {name: "查看未来 5 次触发", exact: true}).click();
+  const preview = page.locator("#detail-content section").filter({hasText: "规则未来触发点"});
+  await expect(preview.locator("li")).toHaveCount(2);
+  await expect(preview.locator("li").first()).toHaveAttribute("title", "2030-01-01T09:00:00Z");
+  await expect(preview.locator("li").last()).toHaveAttribute("title", "2030-01-03T09:00:00Z");
+  expect(await getSchedule(request, schedule.id)).toEqual(before);
+  const runs = await request.get(`/v1/runs?schedule_id=${schedule.id}`, {headers: auth()});
+  expect(await runs.json()).toEqual([]);
 });

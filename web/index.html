@@ -42,7 +42,7 @@
     <div class="workspace-body">
       <header class="topbar"><span>工作空间 <span class="slash">/</span> <strong id="breadcrumb">调度计划</strong></span><div class="topbar-right"><span id="connection-state" class="connection"><i></i> 已连接</span><span class="timezone-label">时间显示：浏览器时区</span></div></header>
       <main id="main-content" tabindex="-1">
-        <div class="page-heading"><div><p class="eyebrow">SCHEDULER OVERVIEW</p><h1 id="page-title">调度计划</h1><p id="page-description" class="muted">安排下一次执行，掌握每一个周期。</p></div><button id="create-schedule" class="primary"><span aria-hidden="true">＋</span> 新建计划</button></div>
+        <div class="page-heading"><div><p class="eyebrow">SCHEDULER OVERVIEW</p><h1 id="page-title">调度计划</h1><p id="page-description" class="muted">安排下一次执行，掌握每一个周期。</p></div><div class="heading-actions"><button id="import-schedules" class="secondary">批量导入</button><button id="create-schedule" class="primary"><span aria-hidden="true">＋</span> 新建计划</button></div></div>
         <section class="stats-grid" aria-label="当前租户统计">
           <article class="stat-card"><span>运行中的计划</span><strong id="stat-active">—</strong><small>等待下一个触发时间</small></article>
           <article class="stat-card"><span>等待执行</span><strong id="stat-pending">—</strong><small>已生成的待投递实例</small></article>
@@ -58,6 +58,7 @@
             <label class="filter-status"><span class="sr-only">状态筛选</span><select id="status-filter" aria-label="状态筛选"></select></label>
             <button class="secondary" type="submit">筛选</button><button id="clear-filters" class="text-button" type="button">清除</button>
             <details id="metadata-filter" class="metadata-filter"><summary>按业务元数据筛选</summary><div class="form-grid"><label>元数据键<input id="metadata-key" placeholder="例如 order_id" maxlength="64" spellcheck="false"></label><label>元数据值<input id="metadata-value" placeholder="精确匹配，可为空" maxlength="512" spellcheck="false"></label></div><p class="field-help">键和值区分大小写；填写后点击「筛选」。</p></details>
+            <details id="run-time-filter" class="metadata-filter" hidden><summary>按原计划时间筛选</summary><div class="form-grid"><label>开始时间（含）<input id="run-from" placeholder="例如 2030-01-01T00:00:00+08:00" spellcheck="false"></label><label>结束时间（不含）<input id="run-until" placeholder="例如 2030-02-01T00:00:00+08:00" spellcheck="false"></label></div><p class="field-help">填写带时区的时间；与状态、计划 ID、业务元数据组合筛选。</p></details>
           </form>
           <p id="list-error" class="error panel-message" role="alert" hidden></p>
           <div id="loading" class="empty-state" role="status" hidden>正在读取工作空间…</div>
@@ -95,6 +96,7 @@
     </form>
   </dialog>
 
+  <dialog id="batch-import" class="editor-dialog" aria-labelledby="batch-title"><div class="dialog-heading"><div><p class="eyebrow">BATCH IMPORT</p><h2 id="batch-title">批量导入计划</h2></div><button class="icon-button" data-close="batch-import" aria-label="关闭批量导入">×</button></div><form id="batch-form"><div class="dialog-content"><p class="notice">每批 1–20 个计划，全部成功才会保存。重试相同内容会复用本次导入，避免重复创建。</p><label for="batch-json">批量计划（JSON）</label><textarea id="batch-json" class="code-input" rows="12" required spellcheck="false" placeholder='{"schedules":[{"name":"订单提醒","trigger":{"type":"delay","seconds":60},"target":{"url":"https://example.com/hook"}}]}'></textarea><p class="field-help">使用 schedules 数组，每项采用与单个计划相同的字段。请求总大小不超过 256 KiB。</p><p id="batch-error" class="error" role="alert" hidden></p></div><footer class="dialog-footer"><button class="secondary" type="button" data-close="batch-import">取消</button><button id="save-batch" class="primary" type="submit">导入计划</button></footer></form></dialog>
   <dialog id="detail" class="detail-dialog" aria-labelledby="detail-title"><div class="dialog-heading"><div><p class="eyebrow" id="detail-eyebrow">DETAIL</p><h2 id="detail-title">详情</h2></div><button class="icon-button" data-close="detail" aria-label="关闭详情">×</button></div><div class="dialog-content" id="detail-content"></div><footer class="dialog-footer" id="detail-actions"></footer></dialog>
   <dialog id="confirm" class="confirm-dialog" aria-labelledby="confirm-title"><div class="dialog-content"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p></div><footer class="dialog-footer"><button class="secondary" id="confirm-no">返回</button><button class="danger" id="confirm-yes">确认</button></footer></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

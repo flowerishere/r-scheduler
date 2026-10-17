@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Inspect real dispatch query plans in disposable PostgreSQL; never uses DATABASE_URL.
 
-Outputs EXPLAIN ANALYZE JSON. This measures the two candidate queries, not total
-service throughput. Example: python3 scripts/explain_dispatch.py > plans.json
+Outputs EXPLAIN ANALYZE JSON for both tenant discovery paths and schedule
+selection, not total service throughput. Example:
+python3 scripts/explain_dispatch.py --idle-tenants 10000 --generic-plan > plans.json
 """
 import argparse
 import json
@@ -16,10 +17,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenants", type=int, default=100)
     parser.add_argument("--runs-per-tenant", type=int, default=100)
+    parser.add_argument("--idle-tenants", type=int, default=0)
+    parser.add_argument("--reverse-turns", action="store_true",
+                        help="serve active tenants in reverse tenant-name order")
+    parser.add_argument("--generic-plan", action="store_true",
+                        help="force PostgreSQL generic plans for typed prepared statements")
     args = parser.parse_args()
-    if not (1 <= args.tenants <= 10000 and 1 <= args.runs_per_tenant <= 10000
+    if not (0 <= args.tenants <= 10000 and 1 <= args.runs_per_tenant <= 10000
+            and 0 <= args.idle_tenants <= 100000
             and args.tenants * args.runs_per_tenant <= 200000):
-        parser.error("tenants and runs-per-tenant must be 1..10000, with at most 200000 runs total")
+        parser.error("tenants must be 0..10000, runs-per-tenant 1..10000, "
+                     "and idle-tenants 0..100000, with at most 200000 pending runs total")
     root = Path(__file__).resolve().parent.parent
     container = "scheduler-explain-" + uuid.uuid4().hex[:12]
     owned = False
@@ -31,6 +39,23 @@ def main():
     def query(sql):
         return docker("exec", "-i", container, "psql", "-X", "-q", "-tA",
                       "-v", "ON_ERROR_STOP=1", "-U", "scheduler", "-d", "scheduler", sql=sql).stdout.strip()
+
+    def explain(sql, parameter_types, values):
+        sql = sql.rstrip().rstrip(";")
+        if args.generic_plan:
+            # PREPARE, plan mode and EXECUTE must share the same psql session.
+            statement = (
+                "SET plan_cache_mode = force_generic_plan;\n"
+                f"PREPARE dispatch_plan ({', '.join(parameter_types)}) AS {sql};\n"
+                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+                f"EXECUTE dispatch_plan ({', '.join(values)});"
+            )
+        else:
+            # Parameters below are static SQL literals, never shell arguments.
+            for n in range(len(values), 0, -1):
+                sql = sql.replace(f"${n}", values[n - 1])
+            statement = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql
+        return json.loads(query(statement))[0]
 
     try:
         docker("create", "--name", container, "-e", "POSTGRES_USER=scheduler",
@@ -56,14 +81,34 @@ def main():
                 statement_timestamp() - INTERVAL '1 day' + n * INTERVAL '1 microsecond',
                 statement_timestamp() - INTERVAL '1 day' + n * INTERVAL '1 microsecond',
                 'pending', s.spec FROM schedules s CROSS JOIN generate_series(1, {args.runs_per_tenant}) n;
+            INSERT INTO tenant_dispatch (tenant_id)
+            SELECT 'a-idle-' || lpad(n::text, 6, '0') FROM generate_series(1, {args.idle_tenants}) n;
             UPDATE tenant_dispatch SET max_concurrent = 8, rate_per_second = 100, burst = 10, tokens = 10;
-            ANALYZE;
         """)
-        plans = {}
-        for name, parameter in [("claim_tenant", "ARRAY[]::text[]"), ("claim_schedule", "'bench-00001'")]:
-            sql = (root / "src" / "sql" / f"{name}.sql").read_text().replace("$1", parameter)
-            plans[name] = json.loads(query("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql))[0]
-        print(json.dumps({"fixture": {"tenants": args.tenants, "runs_per_tenant": args.runs_per_tenant}, "plans": plans}, indent=2))
+        if args.reverse_turns:
+            query(f"""
+                UPDATE tenant_dispatch
+                SET last_served = {args.tenants} - substring(tenant_id FROM 7)::bigint + 1
+                WHERE tenant_id LIKE 'bench-%';
+            """)
+        query("ANALYZE;")
+        tenant_sql = (root / "src" / "sql" / "claim_tenant.sql").read_text()
+        schedule_sql = (root / "src" / "sql" / "claim_schedule.sql").read_text()
+        fast = explain(tenant_sql, ["text[]", "boolean"], ["ARRAY[]::text[]", "false"])
+        plans = {
+            "claim_tenant": fast,  # Preserve the original key for existing consumers.
+            "claim_tenant_fast": fast,
+            "claim_tenant_fallback": explain(
+                tenant_sql, ["text[]", "boolean"], ["ARRAY[]::text[]", "true"]),
+            "claim_schedule": explain(schedule_sql, ["text"], ["'bench-00001'"]),
+        }
+        print(json.dumps({"fixture": {
+            "tenants": args.tenants,
+            "runs_per_tenant": args.runs_per_tenant,
+            "idle_tenants": args.idle_tenants,
+            "reverse_turns": args.reverse_turns,
+            "generic_plan": args.generic_plan,
+        }, "plans": plans}, indent=2))
     finally:
         if owned:
             docker("rm", "-fv", container)

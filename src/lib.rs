@@ -1,4 +1,5 @@
 pub mod api;
+pub mod batch;
 pub mod config;
 pub mod console;
 pub mod dispatch;
@@ -6,6 +7,7 @@ pub mod domain;
 pub mod engine;
 pub mod evaluator;
 pub mod metadata;
+pub mod run_control;
 pub mod store;
 pub mod trigger;
 pub mod webhook;

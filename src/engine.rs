@@ -68,6 +68,7 @@ pub async fn materialize_one(
 
 pub async fn scheduler_tick(store: &Store, evaluator: &Evaluator) -> anyhow::Result<()> {
     let schedules = store.due_schedules(32).await?;
+    let mut first_error = None;
     for batch in schedules.chunks(4) {
         let now = store.now().await?;
         let mut tasks = JoinSet::new();
@@ -82,22 +83,38 @@ pub async fn scheduler_tick(store: &Store, evaluator: &Evaluator) -> anyhow::Res
                     Err(error) => {
                         // Database and evaluator infrastructure failures remain retryable.
                         // Rule failures retain the cursor for repair.
-                        if error.downcast_ref::<crate::store::StoreError>().is_none()
-                            && error.downcast_ref::<crate::evaluator::EvaluatorBusy>().is_none()
-                            && error.downcast_ref::<crate::evaluator::EvaluatorUnavailable>().is_none() {
-                            store.rule_error(&schedule, &format!("{error:#}")).await?;
-                        }
                         tracing::warn!(schedule_id = %schedule.id, error = %format!("{error:#}"), "Schedule expansion failed");
+                        if error.downcast_ref::<crate::store::StoreError>().is_some()
+                            || error.downcast_ref::<crate::evaluator::EvaluatorBusy>().is_some()
+                            || error.downcast_ref::<crate::evaluator::EvaluatorUnavailable>().is_some() {
+                            store.defer_evaluation(&schedule).await?;
+                        } else if let Err(save_error) = store.rule_error(&schedule, &format!("{error:#}")).await {
+                            // A row-specific error while recording the rule failure
+                            // must not keep this schedule at the head indefinitely.
+                            if let Err(retry_error) = store.defer_evaluation(&schedule).await {
+                                tracing::warn!(schedule_id = %schedule.id, %retry_error, "Could not defer failed schedule");
+                            }
+                            return Err(save_error.into());
+                        }
                     }
                 }
                 Ok::<(), anyhow::Error>(())
             });
         }
         while let Some(result) = tasks.join_next().await {
-            result??;
+            // Drain the batch and process the remaining schedules even when a
+            // task fails. Dropping JoinSet would abort healthy sibling tasks.
+            let result = result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 pub async fn scheduler_loop(

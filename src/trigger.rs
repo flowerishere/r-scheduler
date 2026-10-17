@@ -75,6 +75,44 @@ pub fn validate_once(at: DateTime<Utc>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_rrule_parts(value: &str) -> anyhow::Result<()> {
+    // rrule 0.14 accepts these invalid RFC 5545 section 3.3.10 inputs,
+    // sometimes normalizing zero ordinals into ordinary weekdays/month days.
+    let mut has_count = false;
+    let mut has_until = false;
+    for part in value.split(';') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue; // Leave other syntax validation to the RRULE parser.
+        };
+        let key = key.to_ascii_uppercase();
+        match key.as_str() {
+            "COUNT" | "INTERVAL" => {
+                if value.parse::<u32>() == Ok(0) {
+                    bail!("RRULE {key} must be positive");
+                }
+                has_count |= key == "COUNT";
+            }
+            "UNTIL" => has_until = true,
+            "BYMONTHDAY" if value.split(',').any(|day| day.parse::<i32>() == Ok(0)) => {
+                bail!("RRULE BYMONTHDAY must not contain zero");
+            }
+            "BYDAY" | "BYWEEKDAY" => {
+                for day in value.split(',') {
+                    let ordinal = day.get(..day.len().saturating_sub(2)).unwrap_or_default();
+                    if ordinal.parse::<i32>() == Ok(0) {
+                        bail!("RRULE {key} weekday ordinals must not be zero");
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    if has_count && has_until {
+        bail!("RRULE must not combine COUNT and UNTIL");
+    }
+    Ok(())
+}
+
 fn normalize_rrule(value: &str) -> anyhow::Result<String> {
     let mut normalized = String::with_capacity(value.len());
     let mut starts = 0;
@@ -88,7 +126,8 @@ fn normalize_rrule(value: &str) -> anyhow::Result<String> {
         match name.as_str() {
             "EXRULE" => bail!("EXRULE is not supported; use explicit EXDATE values"),
             "DTSTART" => starts += 1,
-            "RRULE" | "RDATE" | "EXDATE" => (),
+            "RRULE" => validate_rrule_parts(dates)?,
+            "RDATE" | "EXDATE" => (),
             _ => bail!("Unsupported calendar property: {name}"),
         }
         normalized.push_str(&name);

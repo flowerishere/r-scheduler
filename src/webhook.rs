@@ -65,6 +65,13 @@ pub fn validate_spec(spec: &ScheduleSpec) -> anyhow::Result<()> {
     {
         bail!("retry.max_age_seconds must be 1..31536000 when provided");
     }
+    if let (Trigger::Once { at }, Some(age)) = (&spec.trigger, spec.retry.max_age_seconds)
+        && at
+            .checked_add_signed(chrono::Duration::seconds(i64::from(age)))
+            .is_none()
+    {
+        bail!("Run deadline exceeds the supported date range");
+    }
     validate_target(&spec.target)?;
     Ok(())
 }

@@ -1,0 +1,18 @@
+{
+  "schedules": [
+    {
+      "name": "订单 42 付款提醒",
+      "trigger": { "type": "delay", "seconds": 60 },
+      "target": { "url": "http://127.0.0.1:9090/hook" },
+      "payload": { "order_id": "order-42", "action": "check_payment" },
+      "metadata": { "order_id": "order-42", "env": "demo" }
+    },
+    {
+      "name": "每日订单汇总",
+      "trigger": { "type": "cron", "expression": "0 9 * * *", "timezone": "Asia/Shanghai" },
+      "target": { "url": "http://127.0.0.1:9090/hook" },
+      "payload": { "action": "daily_summary" },
+      "metadata": { "kind": "summary", "env": "demo" }
+    }
+  ]
+}

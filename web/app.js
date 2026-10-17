@@ -3,7 +3,7 @@ import {parseExactJson, stringifyExactJson} from "./json.js";
 const $ = (id) => document.getElementById(id);
 const statuses = {active: "运行中", paused: "已暂停", completed: "已生成完毕", cancelled: "已取消", error: "规则错误", pending: "待执行", running: "投递中", succeeded: "成功", dead: "失败终止", failed: "失败", lease_expired: "租约过期"};
 const triggerNames = {once: "ONCE", delay: "DELAY", cron: "CRON", rrule: "RRULE"};
-const state = {key: "", session: 0, view: "schedules", offset: 0, filters: {}, request: 0, detail: 0, editor: 0, preview: 0, editing: null, creation: null, timer: null, toast: null, controllers: new Set()};
+const state = {key: "", session: 0, view: "schedules", offset: 0, filters: {}, request: 0, detail: 0, editor: 0, preview: 0, batch: 0, batchCreation: null, editing: null, creation: null, timer: null, toast: null, controllers: new Set()};
 const PAGE_SIZE = 20;
 const dateFormat = new Intl.DateTimeFormat("zh-CN", {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false});
 
@@ -13,7 +13,15 @@ function node(tag, text, className) {
   if (className) element.className = className;
   return element;
 }
-function date(value) { return value ? dateFormat.format(new Date(value)) : "—"; }
+function parseDate(value) {
+  // Chrono uses signed four/five-digit years; browsers require six digits.
+  return new Date(value.replace(/^([+-])(\d{4,5})(?=-)/, (_, sign, year) => sign + year.padStart(6, "0")));
+}
+function date(value) {
+  if (!value) return "—";
+  const parsed = parseDate(value);
+  return Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() <= 0 ? value : dateFormat.format(parsed);
+}
 function showError(id, error) { $(id).textContent = error?.message || String(error); $(id).hidden = false; }
 function hideError(id) { $(id).textContent = ""; $(id).hidden = true; }
 function toast(message) { clearTimeout(state.toast); $("toast").textContent = message; $("toast").hidden = false; state.toast = setTimeout(() => { $("toast").hidden = true; }, 4000); }
@@ -25,11 +33,11 @@ function action(text, handler, className = "secondary compact") {
 function jsonBox(value) { return node("pre", stringifyExactJson(value, 2), "json-box"); }
 function silent(error) { return error?.name === "AbortError"; }
 
-async function api(path, {method = "GET", body, idempotency} = {}) {
+async function api(path, {method = "GET", body, idempotency, timeoutMs = 20000} = {}) {
   const session = state.session;
   const controller = new AbortController();
   state.controllers.add(controller);
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers = {Authorization: `Bearer ${state.key}`};
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -65,6 +73,7 @@ function logout(message = "") {
   $("table-body").replaceChildren(); $("detail-content").replaceChildren();
   $("detail-actions").replaceChildren(); $("preview-result").replaceChildren();
   $("schedule-form").reset(); $("filters").reset();
+  $("batch-form").reset(); state.batch++; state.batchCreation = null; hideError("batch-error");
   state.editing = null; state.creation = null; state.offset = 0; state.filters = {};
   $("toast").hidden = true; hideError("editor-error"); hideError("list-error");
   for (const id of ["stat-active", "stat-pending", "stat-succeeded", "stat-dead", "schedule-count"]) $(id).textContent = "—";
@@ -109,7 +118,7 @@ function configureView() {
   $("page-description").textContent = schedules ? "安排下一次执行，掌握每一个周期。" : "查看每次投递的结果，定位错误并追踪重试。";
   $("list-title").textContent = schedules ? "全部计划" : "执行历史";
   $("search-field").hidden = !schedules; $("run-schedule-field").hidden = schedules;
-  $("metadata-filter").hidden = !schedules;
+  $("run-time-filter").hidden = schedules;
   $("status-filter").replaceChildren(new Option("全部状态", ""), ...(schedules ? ["active", "paused", "completed", "error", "cancelled"] : ["pending", "running", "succeeded", "dead", "cancelled"]).map((s) => new Option(statuses[s], s)));
   for (const button of document.querySelectorAll("[data-view]")) {
     const active = button.dataset.view === state.view;
@@ -132,22 +141,30 @@ async function switchView(view, scheduleId = "") {
 for (const button of document.querySelectorAll("[data-view]")) button.addEventListener("click", () => void switchView(button.dataset.view));
 $("refresh").addEventListener("click", () => void refresh());
 function applyFilters() {
-  state.filters = {status: $("status-filter").value};
+  const filters = {status: $("status-filter").value};
+  // Computed keys preserve literal dots, brackets and __proto__ as data.
+  if ($("metadata-key").value) filters.metadata = JSON.stringify({[$("metadata-key").value]: $("metadata-value").value});
   if (state.view === "schedules") {
-    state.filters.q = $("search").value.trim();
-    // Computed keys preserve literal dots, brackets and __proto__ as data.
-    if ($("metadata-key").value) state.filters.metadata = JSON.stringify({[$("metadata-key").value]: $("metadata-value").value});
+    filters.q = $("search").value.trim();
+  } else {
+    filters.schedule_id = $("run-schedule-id").value.trim();
+    for (const [name, id] of [["from", "run-from"], ["until", "run-until"]]) {
+      const value = $(id).value.trim();
+      if (value && (!/(Z|[+-]\d{2}:\d{2})$/i.test(value) || Number.isNaN(parseDate(value).getTime()))) throw new Error("筛选时间需要包含有效日期和时区。");
+      if (value) filters[name] = value;
+    }
+    // Let the API compare bounds without losing sub-millisecond precision.
   }
-  else state.filters.schedule_id = $("run-schedule-id").value.trim();
-  state.offset = 0;
+  state.filters = filters; state.offset = 0;
 }
 $("filters").addEventListener("submit", (event) => {
   event.preventDefault();
-  if (state.view === "schedules" && $("metadata-value").value && !$("metadata-key").value) {
+  if ($("metadata-value").value && !$("metadata-key").value) {
     $("metadata-filter").open = true; $("metadata-key").focus();
     showError("list-error", "填写元数据值时，需要同时填写元数据键。"); return;
   }
-  applyFilters(); void refresh();
+  try { applyFilters(); void refresh(); }
+  catch (error) { $("run-time-filter").open = true; showError("list-error", error); }
 });
 $("clear-filters").addEventListener("click", () => { $("filters").reset(); applyFilters(); void refresh(); });
 $("previous-page").addEventListener("click", () => { state.offset = Math.max(0, state.offset - PAGE_SIZE); void refresh(); });
@@ -278,7 +295,7 @@ function readTrigger() {
   if (type === "delay") return {type, seconds: integer("delay-seconds")};
   if (type === "once") {
     const value = $("once-at").value.trim();
-    if (!/(Z|[+-]\d{2}:\d{2})$/i.test(value) || Number.isNaN(Date.parse(value))) throw new Error("执行时间需要包含时区，例如 2026-10-01T09:00:00+08:00。");
+    if (!/(Z|[+-]\d{2}:\d{2})$/i.test(value) || Number.isNaN(parseDate(value).getTime())) throw new Error("执行时间需要包含时区，例如 2026-10-01T09:00:00+08:00。");
     // Preserve sub-millisecond precision and let the API validate the actual
     // calendar date. Date.toISOString() silently normalizes e.g. February 30.
     return {type, at: value};
@@ -329,7 +346,7 @@ $("schedule-form").addEventListener("submit", async (event) => {
     if (editing) await api(`/schedules/${editing.id}`, {method: "PUT", body: {expected_revision: editing.revision, spec}});
     else {
       const encoded = stringifyExactJson(spec);
-      if (!state.creation || state.creation.encoded !== encoded) state.creation = {encoded, key: `console-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")}`};
+      if (!state.creation || state.creation.encoded !== encoded) state.creation = {encoded, key: creationKey()};
       await api("/schedules", {method: "POST", body: spec, idempotency: state.creation.key});
     }
     if (session !== state.session) return;
@@ -345,6 +362,34 @@ $("schedule-form").addEventListener("submit", async (event) => {
   } finally { if (editor === state.editor) $("save-schedule").disabled = false; }
 });
 $("editor").addEventListener("close", () => { state.editor++; invalidatePreview(); });
+
+function creationKey() {
+  return `console-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+$("import-schedules").addEventListener("click", () => {
+  state.batch++; state.batchCreation = null; $("batch-form").reset(); hideError("batch-error");
+  $("save-batch").disabled = false; $("batch-import").showModal(); $("batch-json").focus();
+});
+$("batch-import").addEventListener("close", () => { state.batch++; });
+$("batch-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if ($("save-batch").disabled) return;
+  const batch = state.batch, session = state.session;
+  const current = () => batch === state.batch && session === state.session && $("batch-import").open;
+  hideError("batch-error"); $("save-batch").disabled = true;
+  try {
+    const body = parseJson("batch-json", "批量计划");
+    if (!body || !Array.isArray(body.schedules) || body.schedules.length < 1 || body.schedules.length > 20) throw new Error("schedules 必须是包含 1–20 个计划的数组。");
+    const encoded = stringifyExactJson(body);
+    if (!state.batchCreation || state.batchCreation.encoded !== encoded) state.batchCreation = {encoded, key: creationKey()};
+    const schedules = await api("/schedules/batch", {method: "POST", body, idempotency: state.batchCreation.key, timeoutMs: 60000});
+    if (session !== state.session) return;
+    toast(`已导入 ${schedules.length} 个计划`);
+    if (current()) { $("batch-import").close(); await switchView("schedules"); }
+    else await refresh(true);
+  } catch (error) { if (current() && !silent(error)) showError("batch-error", error); }
+  finally { if (current()) $("save-batch").disabled = false; }
+});
 
 for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => $(button.dataset.close).close());
 function confirm(title, description, label) {
@@ -384,6 +429,40 @@ async function replayRun(run, button) {
   finally { button.disabled = false; }
 }
 
+async function controlPendingRun(run, operation, button, timing) {
+  const detail = state.detail, session = state.session;
+  const current = () => session === state.session && detail === state.detail && $("detail").open;
+  button.disabled = true;
+  try {
+    if (operation === "cancel" && !await confirm("取消这个执行实例？", "只取消这一个尚未开始的实例，计划的后续周期不受影响。已经开始的投递无法取消。", "取消实例")) return;
+    if (timing?.seconds === 0 && !await confirm("立即将这个实例入队？", "保留原计划时间、截止时间和投递历史。暂停状态、投递配额与串行策略仍然生效。", "立即入队")) return;
+    if (!current()) return;
+    const body = operation === "reschedule" ? {expected_available_at: run.available_at, timing} : undefined;
+    await api(`/runs/${run.id}/${operation}`, {method: "POST", body});
+    if (!current()) return;
+    toast(operation === "cancel" ? "实例已取消" : timing.seconds === 0 ? "实例已入队，等待投递" : "实例入队时间已调整");
+    await openDetail("run", run.id);
+    await refresh();
+  } catch (error) { if (current() && !silent(error)) reportActionError(error); }
+  finally { button.disabled = false; }
+}
+
+function pendingRunControls(run) {
+  const form = node("form", null, "run-controls"), label = node("label", "从现在起延后多少秒入队"), input = node("input");
+  input.id = "run-delay-seconds"; input.type = "number"; input.min = "0"; input.max = "31536000"; input.step = "1"; input.value = "60"; input.required = true;
+  label.htmlFor = input.id; label.append(input);
+  const save = node("button", "调整入队时间", "secondary compact"); save.type = "submit";
+  const actions = node("div", null, "toolbar");
+  actions.append(save, action("立即入队", (button) => controlPendingRun(run, "reschedule", button, {type: "delay", seconds: 0})), action("取消实例", (button) => controlPendingRun(run, "cancel", button), "danger compact"));
+  form.append(label, node("p", "0 表示立即入队。不会延长原截止时间，也不会改变后续周期；暂停的计划仍需恢复后才能投递。", "field-help"), actions);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (save.disabled || !form.reportValidity()) return;
+    void controlPendingRun(run, "reschedule", save, {type: "delay", seconds: Number(input.value)});
+  });
+  return section("管理待执行实例", form);
+}
+
 function reportActionError(error) {
   if ($("detail").open) { const message = node("p", error.message, "error"); message.setAttribute("role", "alert"); $("detail-content").prepend(message); message.scrollIntoView({block: "nearest"}); }
   else toast(error.message);
@@ -391,6 +470,27 @@ function reportActionError(error) {
 
 function fact(grid, title, value) { const group = node("div"); const description = node("dd"); description.append(value instanceof Node ? value : document.createTextNode(String(value ?? "—"))); group.append(node("dt", title), description); grid.append(group); }
 function section(title, content) { const wrapper = node("section", null, "detail-section"); wrapper.append(node("h3", title), content); return wrapper; }
+function occurrencePreview(schedule, detail) {
+  const wrapper = node("div"), result = node("div");
+  const current = () => detail === state.detail && $("detail").open;
+  const button = action("查看未来 5 次触发", async (button) => {
+    button.disabled = true; result.replaceChildren();
+    try {
+      const preview = await api(`/schedules/${schedule.id}/occurrences?count=5`);
+      if (!current()) return;
+      if (preview.revision !== schedule.revision) throw new Error("计划已更新，请刷新详情后重新预览。");
+      const list = node("ol");
+      for (const value of preview.dates) { const item = node("li", date(value)); item.title = value; list.append(item); }
+      result.append(list);
+      if (!preview.dates.length) result.append(node("p", "当前时间之后没有触发点。", "muted"));
+      else if (preview.exhausted) result.append(node("p", "以上为全部剩余触发时间。", "muted"));
+    } catch (error) { if (current() && !silent(error)) result.append(node("p", error.message, "error")); }
+    finally { if (current()) button.disabled = false; }
+  });
+  result.setAttribute("aria-live", "polite");
+  wrapper.append(button, node("p", "预览规则不会创建执行实例。暂停、取消和漏调度策略会影响实际投递。", "field-help"), result);
+  return section("规则未来触发点", wrapper);
+}
 function attemptHistory(id, initial, detail) {
   const timeline = node("div"), cursors = [null];
   let loading = false;
@@ -460,14 +560,16 @@ async function openDetail(kind, id) {
       fact(grid, "租约截止时间", date(item.lease_until));
       if (item.status === "dead") {
         const replay = action("重放实例", (button) => replayRun(item, button), "primary compact");
-        if (item.expires_at && new Date(item.expires_at).getTime() <= Date.now()) { replay.disabled = true; replay.title = "实例已超过认领截止时间"; }
+        if (item.expires_at && parseDate(item.expires_at).getTime() <= Date.now()) { replay.disabled = true; replay.title = "实例已超过认领截止时间"; }
         $("detail-actions").append(replay);
       }
     }
     $("detail-actions").append(action("刷新详情", () => openDetail(kind, id)));
     $("detail-content").append(grid);
+    if (kind === "schedule") $("detail-content").append(occurrencePreview(item, request));
     if (item.last_error) $("detail-content").append(node("p", item.last_error, "error"));
     if (kind === "run") {
+      if (item.status === "pending") $("detail-content").append(pendingRunControls(item));
       $("detail-content").append(section("投递尝试", attemptHistory(id, attempts, request)));
     }
     $("detail-content").append(section(kind === "run" ? "本次执行的计划快照" : "计划配置", jsonBox(item.spec)));

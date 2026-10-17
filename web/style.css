@@ -11,4 +11,6 @@ dialog{border:1px solid #dce4dc;border-radius:12px;padding:0;color:var(--ink);bo
 @media(prefers-reduced-motion:no-preference){button{transition:background .15s,border-color .15s}dialog[open]{animation:appear .15s ease-out}@keyframes appear{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}}
 
 /* Keep optional business filters on their own row at every viewport width. */
+.heading-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}.page-heading{flex-wrap:wrap}
 .filters{flex-wrap:wrap}.metadata-filter{flex:0 0 100%;min-width:0}.metadata-filter summary{font-size:12px;color:var(--green);cursor:pointer}.metadata-filter .form-grid{margin-top:12px;max-width:620px}.metadata-filter .form-grid label{min-width:0}.metadata-filter input{width:100%;min-width:0}.metadata-filter .field-help{margin-bottom:0}
+.run-controls .toolbar{display:flex;gap:8px;flex-wrap:wrap}

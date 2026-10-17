@@ -26,6 +26,9 @@ use crate::{
     webhook::validate_spec,
 };
 
+mod batch;
+mod run_control;
+
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_API_REQUESTS: usize = 64;
@@ -145,7 +148,9 @@ pub fn router(state: AppState) -> Router {
         .route("/capacity", get(capacity))
         .route("/preview", post(preview))
         .route("/schedules", post(create).get(list_schedules))
+        .route("/schedules/batch", post(batch::create))
         .route("/schedules/{id}", get(get_schedule).put(replace))
+        .route("/schedules/{id}/occurrences", get(occurrences))
         .route("/schedules/{id}/pause", post(pause))
         .route("/schedules/{id}/resume", post(resume))
         .route("/schedules/{id}/cancel", post(cancel))
@@ -153,6 +158,8 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/attempts", get(attempts))
         .route("/runs/{id}/replay", post(replay))
+        .route("/runs/{id}/cancel", post(run_control::cancel))
+        .route("/runs/{id}/reschedule", post(run_control::reschedule))
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
@@ -304,6 +311,14 @@ async fn preview(
 async fn prepare(state: &AppState, spec: &mut ScheduleSpec) -> Result<DateTime<Utc>> {
     validate_spec(spec).map_err(ApiError::bad)?;
     let now = state.store.now().await?;
+    prepare_at(state, spec, now).await
+}
+
+async fn prepare_at(
+    state: &AppState,
+    spec: &mut ScheduleSpec,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
     resolve_delay(&mut spec.trigger, now).map_err(ApiError::bad)?;
     if let Trigger::Once { at } = &spec.trigger {
         return Ok(*at);
@@ -325,6 +340,29 @@ async fn create(
     headers: HeaderMap,
     Json(mut spec): Json<ScheduleSpec>,
 ) -> Result<(StatusCode, Json<Schedule>)> {
+    let key = idempotency_key(&headers)?;
+    let hash = request_hash(&spec)?;
+    if let Some(key) = key
+        && let Some(existing) = state.store.find_idempotent(&tenant.0, key, &hash).await?
+    {
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+    let next = prepare(&state, &mut spec).await?;
+    let (created, schedule) = state
+        .store
+        .create_with_outcome(&tenant.0, spec, next, key, &hash)
+        .await?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(schedule),
+    ))
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>> {
     let mut keys = headers.get_all("idempotency-key").iter();
     let key = keys.next();
     if keys.next().is_some() {
@@ -336,21 +374,14 @@ async fn create(
     if key.is_some_and(|key| key.is_empty() || key.len() > 200) {
         return Err(ApiError::bad("Idempotency-Key must contain 1..200 bytes"));
     }
-    let hash = format!(
+    Ok(key)
+}
+
+fn request_hash(value: &impl serde::Serialize) -> Result<String> {
+    Ok(format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&spec).map_err(ApiError::internal)?)
-    );
-    if let Some(key) = key
-        && let Some(existing) = state.store.find_idempotent(&tenant.0, key, &hash).await?
-    {
-        return Ok((StatusCode::OK, Json(existing)));
-    }
-    let next = prepare(&state, &mut spec).await?;
-    let schedule = state
-        .store
-        .create(&tenant.0, spec, next, key, &hash)
-        .await?;
-    Ok((StatusCode::CREATED, Json(schedule)))
+        Sha256::digest(serde_json::to_vec(value).map_err(ApiError::internal)?)
+    ))
 }
 
 #[derive(Deserialize)]
@@ -385,6 +416,9 @@ struct ListQuery {
     offset: i64,
     schedule_id: Option<Uuid>,
     status: Option<String>,
+    metadata: Option<String>,
+    from: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -479,6 +513,49 @@ async fn get_schedule(
     Ok(Json(state.store.get_schedule(&tenant.0, id).await?))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OccurrenceQuery {
+    after: Option<DateTime<Utc>>,
+    #[serde(default = "preview_count")]
+    count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ScheduleOccurrences {
+    schedule_id: Uuid,
+    revision: i64,
+    status: String,
+    after: DateTime<Utc>,
+    #[serde(flatten)]
+    evaluation: Evaluation,
+}
+
+async fn occurrences(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<OccurrenceQuery>,
+) -> Result<Json<ScheduleOccurrences>> {
+    let schedule = state.store.get_schedule(&tenant.0, id).await?;
+    let after = match query.after {
+        Some(after) => after,
+        None => state.store.now().await?,
+    };
+    let evaluation = state
+        .evaluator
+        .next(&schedule.spec.trigger, after, query.count)
+        .await
+        .map_err(ApiError::evaluation)?;
+    Ok(Json(ScheduleOccurrences {
+        schedule_id: id,
+        revision: schedule.revision,
+        status: schedule.status,
+        after,
+        evaluation,
+    }))
+}
+
 async fn pause(
     State(state): State<AppState>,
     Extension(tenant): Extension<Tenant>,
@@ -507,13 +584,24 @@ async fn list_runs(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<Run>>> {
     query.validate()?;
+    let metadata = query
+        .metadata
+        .as_deref()
+        .map(crate::metadata::parse_filter)
+        .transpose()
+        .map_err(ApiError::bad)?;
     Ok(Json(
         state
             .store
-            .list_runs(
+            .search_runs(
                 &tenant.0,
-                query.schedule_id,
-                query.status.as_deref(),
+                crate::store::RunFilter {
+                    schedule_id: query.schedule_id,
+                    status: query.status.as_deref(),
+                    metadata: metadata.as_ref(),
+                    from: query.from,
+                    until: query.until,
+                },
                 query.limit,
                 query.offset,
             )
@@ -553,7 +641,6 @@ async fn attempts(
             .await?,
     ))
 }
-
 async fn replay(
     State(state): State<AppState>,
     Extension(tenant): Extension<Tenant>,

@@ -132,6 +132,121 @@ fn spec(trigger: Value) -> Value {
         "target":{"url":"https://example.invalid/hook"}})
 }
 
+fn invalid_recurrence_parts() -> Vec<String> {
+    [
+        "FREQ=MONTHLY;BYMONTHDAY=0;COUNT=2",
+        "FREQ=MONTHLY;BYMONTHDAY=1,-0;COUNT=2",
+        "FREQ=MONTHLY;BYDAY=0MO;COUNT=2",
+        "FREQ=MONTHLY;BYDAY=MO,+00TU;COUNT=2",
+        "FREQ=MONTHLY;BYWEEKDAY=-0MO;COUNT=2",
+        "FREQ=DAILY;INTERVAL=0;COUNT=2",
+        "FREQ=DAILY;COUNT=0",
+        "FREQ=DAILY;COUNT=2;UNTIL=20300110T090000Z",
+        "FREQ=DAILY;until=20300110T090000Z;count=2",
+    ]
+    .into_iter()
+    // RDATE keeps the set nonempty even when an invalid rule emits no dates.
+    .map(|parts| format!("DTSTART:20300101T090000Z\nRRULE:{parts}\nRDATE:20300115T090000Z"))
+    .collect()
+}
+
+#[test]
+fn invalid_recurrence_parts_cannot_silently_change_occurrences() {
+    for value in invalid_recurrence_parts() {
+        let result = evaluate(EvaluationRequest {
+            trigger: Trigger::Rrule {
+                value: value.clone(),
+            },
+            after: "2029-12-31T00:00:00Z".parse().unwrap(),
+            count: 5,
+        });
+        assert!(result.is_err(), "silently accepted {value}: {result:?}");
+    }
+}
+
+#[test]
+fn recurrence_bounds_apply_per_rule_and_nonzero_ordinals_remain_supported() {
+    for (rules, expected) in [
+        (
+            "RRULE:FREQ=DAILY;COUNT=1\nRRULE:FREQ=DAILY;UNTIL=20300103T090000Z",
+            vec![
+                "2030-01-01T09:00:00Z",
+                "2030-01-02T09:00:00Z",
+                "2030-01-03T09:00:00Z",
+            ],
+        ),
+        (
+            "RRULE:FREQ=MONTHLY;BYMONTHDAY=1,-1;COUNT=3",
+            vec![
+                "2030-01-01T09:00:00Z",
+                "2030-01-31T09:00:00Z",
+                "2030-02-01T09:00:00Z",
+            ],
+        ),
+        (
+            "RRULE:FREQ=MONTHLY;BYDAY=1MO,-1FR;COUNT=3",
+            vec![
+                "2030-01-07T09:00:00Z",
+                "2030-01-25T09:00:00Z",
+                "2030-02-04T09:00:00Z",
+            ],
+        ),
+    ] {
+        let result = evaluate(EvaluationRequest {
+            trigger: Trigger::Rrule {
+                value: format!("DTSTART:20300101T090000Z\n{rules}"),
+            },
+            after: "2029-12-31T00:00:00Z".parse().unwrap(),
+            count: 10,
+        })
+        .unwrap();
+        let expected: Vec<DateTime<Utc>> = expected
+            .into_iter()
+            .map(|date| date.parse().unwrap())
+            .collect();
+        assert_eq!(result.dates, expected, "{rules}");
+        assert!(result.exhausted);
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires PostgreSQL; run scripts/test.sh"]
+async fn invalid_recurrence_parts_never_create_or_replace_schedules(pool: PgPool) {
+    let store = Store { pool };
+    let app = app(store.clone());
+    let (status, existing) = request(
+        &app,
+        "POST",
+        "/v1/schedules",
+        spec(json!({"type":"delay", "seconds":3600})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let uri = format!("/v1/schedules/{}", existing["id"].as_str().unwrap());
+    for value in invalid_recurrence_parts() {
+        let trigger = json!({"type":"rrule", "value":value});
+        for (method, path, body) in [
+            (
+                "POST",
+                "/v1/preview",
+                json!({"trigger":trigger, "after":"2029-12-31T00:00:00Z"}),
+            ),
+            ("POST", "/v1/schedules", spec(trigger.clone())),
+            (
+                "PUT",
+                uri.as_str(),
+                json!({"expected_revision":1, "spec":spec(trigger)}),
+            ),
+        ] {
+            let (status, response) = request(&app, method, path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {response}");
+        }
+    }
+    let schedules = store.list_schedules("a", 100, 0).await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(serde_json::to_value(&schedules[0]).unwrap(), existing);
+}
+
 fn invalid_rules() -> Vec<String> {
     let base = "DTSTART:20300101T090000Z\nRRULE:FREQ=DAILY;COUNT=2";
     [
