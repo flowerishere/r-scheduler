@@ -74,7 +74,7 @@
   <dialog id="editor" class="editor-dialog" aria-labelledby="editor-title">
     <div class="dialog-heading"><div><p class="eyebrow">SCHEDULE</p><h2 id="editor-title">新建计划</h2></div><button class="icon-button" data-close="editor" aria-label="关闭计划编辑">×</button></div>
     <form id="schedule-form">
-      <div class="dialog-content">
+      <fieldset id="schedule-fields" class="dialog-content form-fields" aria-labelledby="editor-title">
         <p id="edit-notice" class="notice" hidden>保存会替换当前规则并取消旧版本尚未执行的实例。已经开始的投递可以完成。</p>
         <label for="job-name">计划名称</label><input id="job-name" name="name" required maxlength="200" placeholder="例如：每日订单汇总">
         <div class="form-grid"><label>触发方式<select id="trigger-type"><option value="delay">延迟执行</option><option value="once">指定时间</option><option value="cron">Cron 周期</option><option value="rrule">RRULE 周期</option></select></label><label data-trigger="delay">延迟秒数<input id="delay-seconds" type="number" min="0" max="31536000" value="30" required></label><label data-trigger="once" hidden>执行时间（带时区）<input id="once-at" placeholder="2026-10-01T09:00:00+08:00"></label></div>
@@ -91,12 +91,12 @@
           <label for="target-headers">自定义请求头（JSON 对象）</label><textarea id="target-headers" class="code-input" rows="3" spellcheck="false">{}</textarea>
         </details>
         <p id="editor-error" class="error" role="alert" hidden></p>
-      </div>
+      </fieldset>
       <footer class="dialog-footer"><button id="reload-editor" class="text-button" type="button" hidden>重新载入最新版本</button><div class="footer-actions"><button class="secondary" type="button" data-close="editor">取消</button><button id="save-schedule" class="primary" type="submit">创建计划</button></div></footer>
     </form>
   </dialog>
 
-  <dialog id="batch-import" class="editor-dialog" aria-labelledby="batch-title"><div class="dialog-heading"><div><p class="eyebrow">BATCH IMPORT</p><h2 id="batch-title">批量导入计划</h2></div><button class="icon-button" data-close="batch-import" aria-label="关闭批量导入">×</button></div><form id="batch-form"><div class="dialog-content"><p class="notice">每批 1–20 个计划，全部成功才会保存。重试相同内容会复用本次导入，避免重复创建。</p><label for="batch-json">批量计划（JSON）</label><textarea id="batch-json" class="code-input" rows="12" required spellcheck="false" placeholder='{"schedules":[{"name":"订单提醒","trigger":{"type":"delay","seconds":60},"target":{"url":"https://example.com/hook"}}]}'></textarea><p class="field-help">使用 schedules 数组，每项采用与单个计划相同的字段。请求总大小不超过 256 KiB。</p><p id="batch-error" class="error" role="alert" hidden></p></div><footer class="dialog-footer"><button class="secondary" type="button" data-close="batch-import">取消</button><button id="save-batch" class="primary" type="submit">导入计划</button></footer></form></dialog>
+  <dialog id="batch-import" class="editor-dialog" aria-labelledby="batch-title"><div class="dialog-heading"><div><p class="eyebrow">BATCH IMPORT</p><h2 id="batch-title">批量导入计划</h2></div><button class="icon-button" data-close="batch-import" aria-label="关闭批量导入">×</button></div><form id="batch-form"><fieldset id="batch-fields" class="dialog-content form-fields" aria-labelledby="batch-title"><p class="notice">每批 1–20 个计划，全部成功才会保存。重试相同内容会复用本次导入，避免重复创建。</p><label for="batch-json">批量计划（JSON）</label><textarea id="batch-json" class="code-input" rows="12" required spellcheck="false" placeholder='{"schedules":[{"name":"订单提醒","trigger":{"type":"delay","seconds":60},"target":{"url":"https://example.com/hook"}}]}'></textarea><p class="field-help">使用 schedules 数组，每项采用与单个计划相同的字段。请求总大小不超过 256 KiB。</p><p id="batch-error" class="error" role="alert" hidden></p></fieldset><footer class="dialog-footer"><button class="secondary" type="button" data-close="batch-import">取消</button><button id="save-batch" class="primary" type="submit">导入计划</button></footer></form></dialog>
   <dialog id="detail" class="detail-dialog" aria-labelledby="detail-title"><div class="dialog-heading"><div><p class="eyebrow" id="detail-eyebrow">DETAIL</p><h2 id="detail-title">详情</h2></div><button class="icon-button" data-close="detail" aria-label="关闭详情">×</button></div><div class="dialog-content" id="detail-content"></div><footer class="dialog-footer" id="detail-actions"></footer></dialog>
   <dialog id="confirm" class="confirm-dialog" aria-labelledby="confirm-title"><div class="dialog-content"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p></div><footer class="dialog-footer"><button class="secondary" id="confirm-no">返回</button><button class="danger" id="confirm-yes">确认</button></footer></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

@@ -245,10 +245,16 @@ function triggerFields() {
   }
   invalidatePreview();
 }
+function setEditorSaving(saving) {
+  $("schedule-fields").disabled = saving;
+  $("save-schedule").disabled = saving;
+  $("reload-editor").disabled = saving;
+  $("schedule-form").setAttribute("aria-busy", String(saving));
+}
 $("trigger-type").addEventListener("change", triggerFields);
 for (const id of ["delay-seconds", "once-at", "cron-expression", "cron-timezone", "rrule-value"]) $(id).addEventListener("input", invalidatePreview);
 function openEditor(schedule = null) {
-  state.editor++; $("save-schedule").disabled = false;
+  state.editor++; setEditorSaving(false);
   $("schedule-form").reset(); $("advanced").open = false; state.editing = schedule; state.creation = null;
   hideError("editor-error"); $("preview-result").replaceChildren();
   $("editor-title").textContent = schedule ? "编辑计划" : "新建计划";
@@ -339,8 +345,10 @@ $("schedule-form").addEventListener("invalid", (event) => {
   if (details) details.open = true;
 }, true);
 $("schedule-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if ($("save-schedule").disabled) return;
   const editor = state.editor, editing = state.editing, session = state.session;
-  event.preventDefault(); hideError("editor-error"); $("save-schedule").disabled = true;
+  hideError("editor-error"); invalidatePreview(); setEditorSaving(true);
   try {
     const spec = readSpec();
     if (editing) await api(`/schedules/${editing.id}`, {method: "PUT", body: {expected_revision: editing.revision, spec}});
@@ -359,24 +367,29 @@ $("schedule-form").addEventListener("submit", async (event) => {
     else await refresh(true);
   } catch (error) {
     if (!silent(error) && state.key && editor === state.editor) { showError("editor-error", error); $("editor-error").scrollIntoView({block: "nearest"}); }
-  } finally { if (editor === state.editor) $("save-schedule").disabled = false; }
+  } finally { if (editor === state.editor) setEditorSaving(false); }
 });
-$("editor").addEventListener("close", () => { state.editor++; invalidatePreview(); });
+$("editor").addEventListener("close", () => { state.editor++; setEditorSaving(false); invalidatePreview(); });
 
 function creationKey() {
   return `console-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
+function setBatchSaving(saving) {
+  $("batch-fields").disabled = saving;
+  $("save-batch").disabled = saving;
+  $("batch-form").setAttribute("aria-busy", String(saving));
+}
 $("import-schedules").addEventListener("click", () => {
   state.batch++; state.batchCreation = null; $("batch-form").reset(); hideError("batch-error");
-  $("save-batch").disabled = false; $("batch-import").showModal(); $("batch-json").focus();
+  setBatchSaving(false); $("batch-import").showModal(); $("batch-json").focus();
 });
-$("batch-import").addEventListener("close", () => { state.batch++; });
+$("batch-import").addEventListener("close", () => { state.batch++; setBatchSaving(false); });
 $("batch-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if ($("save-batch").disabled) return;
   const batch = state.batch, session = state.session;
   const current = () => batch === state.batch && session === state.session && $("batch-import").open;
-  hideError("batch-error"); $("save-batch").disabled = true;
+  hideError("batch-error"); setBatchSaving(true);
   try {
     const body = parseJson("batch-json", "批量计划");
     if (!body || !Array.isArray(body.schedules) || body.schedules.length < 1 || body.schedules.length > 20) throw new Error("schedules 必须是包含 1–20 个计划的数组。");
@@ -388,7 +401,7 @@ $("batch-form").addEventListener("submit", async (event) => {
     if (current()) { $("batch-import").close(); await switchView("schedules"); }
     else await refresh(true);
   } catch (error) { if (current() && !silent(error)) showError("batch-error", error); }
-  finally { if (current()) $("save-batch").disabled = false; }
+  finally { if (current()) setBatchSaving(false); }
 });
 
 for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => $(button.dataset.close).close());
